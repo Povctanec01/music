@@ -1,0 +1,46 @@
+import type { ListeningBehavior } from './types'
+
+const FAVORITES_KEY = 'music-web-favorites'
+const BEHAVIOR_KEY = 'music-web-behavior'
+const SERVER_URL_KEY = 'music-web-server-url'
+const GITHUB_REPO_KEY = 'music-web-github-repo'
+
+export function loadFavorites(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem(FAVORITES_KEY) ?? '[]')
+  } catch {
+    return []
+  }
+}
+
+export function saveFavorites(favorites: string[]) {
+  localStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites))
+}
+
+export function loadBehavior(): Record<string, ListeningBehavior> {
+  try {
+    return JSON.parse(localStorage.getItem(BEHAVIOR_KEY) ?? '{}')
+  } catch {
+    return {}
+  }
+}
+
+export function saveBehavior(behavior: Record<string, ListeningBehavior>) {
+  localStorage.setItem(BEHAVIOR_KEY, JSON.stringify(behavior))
+}
+
+export function loadServerUrl() {
+  return localStorage.getItem(SERVER_URL_KEY) ?? 'http://192.168.1.80:8080'
+}
+
+export function saveServerUrl(url: string) {
+  localStorage.setItem(SERVER_URL_KEY, url)
+}
+
+export function loadGithubRepo() {
+  return localStorage.getItem(GITHUB_REPO_KEY) ?? ''
+}
+
+export function saveGithubRepo(repo: string) {
+  localStorage.setItem(GITHUB_REPO_KEY, repo)
+}
