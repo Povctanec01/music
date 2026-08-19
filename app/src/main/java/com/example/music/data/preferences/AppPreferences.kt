@@ -1,6 +1,7 @@
 package com.example.music.data.preferences
 
 import android.content.Context
+import android.net.Uri
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
@@ -10,6 +11,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.music.domain.model.DownloadNetworkMode
+import com.example.music.domain.model.Track
 import com.example.music.domain.recommendation.TrackBehavior
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -30,7 +32,7 @@ class AppPreferences(
         it[Keys.LAN_URL] ?: DEFAULT_LAN_URL
     }
     val tailscaleUrl: Flow<String> = dataStore.data.map { it[Keys.TAILSCALE_URL] ?: DEFAULT_TAILSCALE_URL }
-    val githubRepo: Flow<String> = dataStore.data.map { it[Keys.GITHUB_REPO].orEmpty() }
+    val githubRepo: Flow<String> = dataStore.data.map { it[Keys.GITHUB_REPO] ?: DEFAULT_GITHUB_REPO }
     val downloadNetworkMode: Flow<DownloadNetworkMode> = dataStore.data.map { prefs ->
         runCatching {
             DownloadNetworkMode.valueOf(prefs[Keys.NETWORK_MODE] ?: DownloadNetworkMode.WIFI_ONLY.name)
@@ -160,6 +162,22 @@ class AppPreferences(
         )
     }
 
+    suspend fun cachedTracks(folderUri: String): List<Track> {
+        val raw = dataStore.data.first()[Keys.CACHED_LIBRARY].orEmpty()
+        if (raw.isBlank()) return emptyList()
+        val snapshot = runCatching { json.decodeFromString<CachedLibrarySnapshot>(raw) }.getOrNull() ?: return emptyList()
+        if (snapshot.folderUri != folderUri) return emptyList()
+        return snapshot.tracks.map { it.toTrack() }
+    }
+
+    suspend fun saveCachedTracks(folderUri: String, tracks: List<Track>) {
+        val snapshot = CachedLibrarySnapshot(
+            folderUri = folderUri,
+            tracks = tracks.map(CachedTrack::fromTrack),
+        )
+        dataStore.edit { it[Keys.CACHED_LIBRARY] = json.encodeToString(snapshot) }
+    }
+
     private suspend fun mutateTrackBehavior(
         trackId: String,
         update: (TrackBehavior) -> TrackBehavior,
@@ -191,11 +209,13 @@ class AppPreferences(
         val POSITION_MS = longPreferencesKey("position_ms")
         val LAST_MEDIA_ID = stringPreferencesKey("last_media_id")
         val LISTENING_BEHAVIOR = stringPreferencesKey("listening_behavior")
+        val CACHED_LIBRARY = stringPreferencesKey("cached_library")
     }
 
     companion object {
         const val DEFAULT_LAN_URL = "http://192.168.1.80:8080"
         const val DEFAULT_TAILSCALE_URL = "http://100.106.26.26:8080"
+        const val DEFAULT_GITHUB_REPO = "Povctanec01/music"
     }
 }
 
@@ -207,3 +227,60 @@ data class PlaybackSnapshot(
     val shuffle: Boolean,
     val repeatMode: Int,
 )
+
+@kotlinx.serialization.Serializable
+private data class CachedLibrarySnapshot(
+    val folderUri: String,
+    val tracks: List<CachedTrack>,
+)
+
+@kotlinx.serialization.Serializable
+private data class CachedTrack(
+    val id: String,
+    val uri: String,
+    val displayName: String,
+    val relativePath: String,
+    val title: String,
+    val artist: String,
+    val album: String,
+    val durationMs: Long,
+    val size: Long,
+    val year: Int? = null,
+    val trackNumber: Int? = null,
+    val addedAt: Long,
+    val mimeType: String,
+) {
+    fun toTrack(): Track = Track(
+        id = id,
+        uri = Uri.parse(uri),
+        displayName = displayName,
+        relativePath = relativePath,
+        title = title,
+        artist = artist,
+        album = album,
+        durationMs = durationMs,
+        size = size,
+        year = year,
+        trackNumber = trackNumber,
+        addedAt = addedAt,
+        mimeType = mimeType,
+    )
+
+    companion object {
+        fun fromTrack(track: Track): CachedTrack = CachedTrack(
+            id = track.id,
+            uri = track.uri.toString(),
+            displayName = track.displayName,
+            relativePath = track.relativePath,
+            title = track.title,
+            artist = track.artist,
+            album = track.album,
+            durationMs = track.durationMs,
+            size = track.size,
+            year = track.year,
+            trackNumber = track.trackNumber,
+            addedAt = track.addedAt,
+            mimeType = track.mimeType,
+        )
+    }
+}

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
@@ -46,9 +47,12 @@ fun SyncScreen(viewModel: SyncViewModel = viewModel()) {
     val running by viewModel.downloads.running.collectAsStateWithLifecycle()
     val paused by viewModel.downloads.paused.collectAsStateWithLifecycle()
     val message by viewModel.downloads.statusMessage.collectAsStateWithLifecycle()
+    val lastError by viewModel.downloads.lastError.collectAsStateWithLifecycle()
     val selectedCount = state.newFiles.count { it.path in state.selected }
+    val failedTasks = tasks.filter { it.status == DownloadStatus.ERROR && !it.error.isNullOrBlank() }
 
     Scaffold(
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
                 title = { Text("Синхронизация") },
@@ -103,6 +107,11 @@ fun SyncScreen(viewModel: SyncViewModel = viewModel()) {
                     Text(it, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(16.dp))
                 }
             }
+            lastError?.let {
+                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                    Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(16.dp))
+                }
+            }
 
             if (tasks.isNotEmpty()) {
                 val done = tasks.count { it.status == DownloadStatus.DONE }
@@ -120,6 +129,21 @@ fun SyncScreen(viewModel: SyncViewModel = viewModel()) {
                             if (running && !paused) OutlinedButton(onClick = viewModel::pause) { Text("Пауза") }
                             if (paused) OutlinedButton(onClick = viewModel::resume) { Text("Продолжить") }
                             TextButton(onClick = viewModel::cancel) { Text("Отмена") }
+                        }
+                    }
+                }
+            }
+
+            if (failedTasks.isNotEmpty()) {
+                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Ошибки загрузки", style = MaterialTheme.typography.titleMedium)
+                        failedTasks.forEach { task ->
+                            Text(
+                                "${task.path.substringAfterLast('/')} — ${task.error}",
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                         }
                     }
                 }

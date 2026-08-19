@@ -134,6 +134,13 @@ def github_latest_release(repo: str) -> dict:
     }
 
 
+def content_disposition(filename: str) -> str:
+    ascii_fallback = filename.encode("ascii", "ignore").decode("ascii").strip()
+    ascii_fallback = ascii_fallback.replace("\\", "_").replace('"', "_") or "download"
+    utf8_name = urllib.parse.quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_name}"
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -246,7 +253,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         if status == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
+        self.send_header("Content-Disposition", content_disposition(target.name))
         self.end_headers()
         if self.command == "HEAD":
             return

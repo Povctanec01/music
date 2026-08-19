@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -38,6 +40,7 @@ class AppUpdateManager(
     private val server: ServerClient,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val checkMutex = Mutex()
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(5, TimeUnit.MINUTES)
@@ -70,6 +73,7 @@ class AppUpdateManager(
     }
 
     suspend fun checkForUpdates() {
+        checkMutex.withLock {
         val repo = preferences.githubRepoOnce().trim()
         _state.update {
             it.copy(
@@ -107,6 +111,7 @@ class AppUpdateManager(
                     message = error.message ?: "Не удалось проверить обновления",
                 )
             }
+        }
         }
     }
 

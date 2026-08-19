@@ -36,7 +36,11 @@ class LibraryRepository(
         scope.launch {
             preferences.folderUri.collectLatest { uriString ->
                 if (!uriString.isNullOrBlank()) {
-                    scan(Uri.parse(uriString))
+                    val cached = preferences.cachedTracks(uriString)
+                    if (cached.isNotEmpty()) {
+                        _tracks.value = cached
+                    }
+                    scan(Uri.parse(uriString), showLoading = cached.isEmpty())
                 } else {
                     _tracks.value = emptyList()
                 }
@@ -46,22 +50,28 @@ class LibraryRepository(
 
     suspend fun setFolder(uri: Uri) {
         val resolver = context.contentResolver
-        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-        try {
-            resolver.takePersistableUriPermission(uri, flags)
-        } catch (_: SecurityException) {
-            resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
+        val readFlag = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        val writeFlag = Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        runCatching {
+            resolver.takePersistableUriPermission(uri, readFlag or writeFlag)
+        }.recoverCatching {
+            resolver.takePersistableUriPermission(uri, readFlag)
+            resolver.takePersistableUriPermission(uri, writeFlag)
+        }.recoverCatching {
+            resolver.takePersistableUriPermission(uri, readFlag)
+        }.getOrThrow()
         preferences.setFolderUri(uri.toString())
     }
 
-    suspend fun scan(uri: Uri? = null) {
+    suspend fun scan(uri: Uri? = null, showLoading: Boolean = true) {
         val folder = uri ?: preferences.folderUriOnce()?.let(Uri::parse) ?: return
-        _isScanning.value = true
+        val folderString = folder.toString()
+        _isScanning.value = showLoading
         _error.value = null
         try {
             val result = withContext(Dispatchers.IO) { scanner.scan(folder) }
             _tracks.value = result
+            preferences.saveCachedTracks(folderString, result)
         } catch (e: SecurityException) {
             _error.value = "Нет доступа к папке. Выберите её ещё раз."
             _tracks.value = emptyList()

@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.width
@@ -46,7 +47,6 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
     val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     var lan by remember { mutableStateOf(state.lanUrl) }
     var tailscale by remember { mutableStateOf(state.tailscaleUrl) }
-    var githubRepo by remember { mutableStateOf(state.githubRepo) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         uri?.let(viewModel::selectFolder)
     }
@@ -55,11 +55,8 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
         if (lan != state.lanUrl && state.lanUrl.isNotBlank()) lan = state.lanUrl
         if (tailscale != state.tailscaleUrl) tailscale = state.tailscaleUrl
     }
-    LaunchedEffect(state.githubRepo) {
-        if (githubRepo != state.githubRepo) githubRepo = state.githubRepo
-    }
-
     Scaffold(
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = { TopAppBar(title = { Text("Настройки") }) },
     ) { padding ->
         Column(
@@ -120,18 +117,10 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
                 Column(Modifier.padding(16.dp)) {
                     Text("APK обновления", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "Тег релиза должен быть в формате v1.2.0+12, где +12 это versionCode.",
+                        "Приложение само проверяет новые версии при запуске. Android всё равно покажет системный экран установки.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 4.dp),
-                    )
-                    OutlinedTextField(
-                        value = githubRepo,
-                        onValueChange = { githubRepo = it },
-                        label = { Text("GitHub repo") },
-                        placeholder = { Text("owner/repo") },
-                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                        singleLine = true,
                     )
                     Text(
                         "Текущая версия: ${updateState.currentVersionName} (${updateState.currentVersionCode})",
@@ -145,20 +134,7 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
                     }
                     Row(modifier = Modifier.padding(top = 12.dp)) {
                         Button(
-                            onClick = {
-                                viewModel.setGithubRepo(githubRepo)
-                                viewModel.checkForUpdates()
-                            },
-                            enabled = !updateState.checking && !updateState.downloading,
-                        ) {
-                            Text(if (updateState.checking) "Проверка…" else "Проверить обновления")
-                        }
-                        Spacer(Modifier.width(12.dp))
-                        Button(
-                            onClick = {
-                                viewModel.setGithubRepo(githubRepo)
-                                viewModel.downloadAndInstallUpdate()
-                            },
+                            onClick = viewModel::downloadAndInstallUpdate,
                             enabled = updateState.updateAvailable && !updateState.downloading && !updateState.checking,
                         ) {
                             Text(if (updateState.downloading) "Скачивание…" else "Скачать и установить")

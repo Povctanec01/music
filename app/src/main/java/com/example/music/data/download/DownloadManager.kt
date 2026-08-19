@@ -49,6 +49,9 @@ class DownloadManager(
     private val _statusMessage = MutableStateFlow<String?>(null)
     val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
 
+    private val _lastError = MutableStateFlow<String?>(null)
+    val lastError: StateFlow<String?> = _lastError.asStateFlow()
+
     private val _endpoint = MutableStateFlow<ServerEndpoint?>(null)
     val endpoint: StateFlow<ServerEndpoint?> = _endpoint.asStateFlow()
 
@@ -56,6 +59,7 @@ class DownloadManager(
 
     fun enqueue(files: List<RemoteFile>) {
         _tasks.value = files.map { DownloadTask(path = it.path, size = it.size) }
+        _lastError.value = null
         resume()
     }
 
@@ -84,6 +88,11 @@ class DownloadManager(
         val folder = preferences.folderUriOnce()?.let(Uri::parse)
         if (folder == null) {
             _statusMessage.value = "Сначала выберите папку для музыки"
+            return
+        }
+        if (!storage.root(folder).canWrite()) {
+            _statusMessage.value = "Нет записи в выбранную папку. Выберите папку ещё раз."
+            _lastError.value = "SAF не дал write-доступ к папке назначения."
             return
         }
         val endpoint = server.pickEndpoint(preferences.lanUrlOnce(), preferences.tailscaleUrlOnce())
@@ -138,13 +147,21 @@ class DownloadManager(
                         markPaused(next.path, e.message)
                         _paused.value = true
                         _statusMessage.value = "Связь с сервером пропала. Загрузка на паузе."
+                        _lastError.value = e.message
                     } else {
                         updateTask(next.path) { it.copy(status = DownloadStatus.ERROR, error = e.message) }
+                        val fileName = next.path.substringAfterLast('/')
+                        val reason = e.message ?: "Неизвестная ошибка"
+                        _lastError.value = "$fileName: $reason"
                     }
                 }
             }
             val hasErrors = _tasks.value.any { it.status == DownloadStatus.ERROR }
-            _statusMessage.value = if (hasErrors) "Готово, есть ошибки" else "Все выбранные треки скачаны"
+            _statusMessage.value = if (hasErrors) {
+                _lastError.value?.let { "Готово, есть ошибки. $it" } ?: "Готово, есть ошибки"
+            } else {
+                "Все выбранные треки скачаны"
+            }
             onFinished()
         } finally {
             _running.value = false

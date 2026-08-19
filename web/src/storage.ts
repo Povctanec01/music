@@ -4,6 +4,7 @@ const FAVORITES_KEY = 'music-web-favorites'
 const BEHAVIOR_KEY = 'music-web-behavior'
 const SERVER_URL_KEY = 'music-web-server-url'
 const GITHUB_REPO_KEY = 'music-web-github-repo'
+const DEFAULT_GITHUB_REPO = 'Povctanec01/music'
 
 export function loadFavorites(): string[] {
   try {
@@ -38,7 +39,7 @@ export function saveServerUrl(url: string) {
 }
 
 export function loadGithubRepo() {
-  return localStorage.getItem(GITHUB_REPO_KEY) ?? ''
+  return localStorage.getItem(GITHUB_REPO_KEY) ?? DEFAULT_GITHUB_REPO
 }
 
 export function saveGithubRepo(repo: string) {
