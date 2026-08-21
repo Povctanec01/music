@@ -26,7 +26,7 @@ export function buildRecommendationSections(
     .slice(0, 10)
 
   const favoriteTracks = tracks.filter((track) => favorites.has(track.id)).slice(0, 12)
-  const newOnDevice = [...tracks].sort((a, b) => b.id.localeCompare(a.id)).slice(0, 12)
+  const newOnDevice = [...tracks].sort((a, b) => b.addedAt - a.addedAt).slice(0, 12)
 
   const artistAffinity = new Map<string, number>()
   recommended.slice(0, 5).forEach((track) => {
@@ -43,7 +43,7 @@ export function buildRecommendationSections(
     section('because', 'Because You Like', 'Похожие по артистам и тому, что ты крутишь чаще', becauseYouLike),
     section('recent', 'Recently Played', 'Быстрый возврат к последним прослушиваниям', recentlyPlayed),
     section('favorites', 'Favorites', 'Все, что ты уже отметил как любимое', favoriteTracks),
-    section('new', 'New On Device', 'Недавно добавленные локальные треки', newOnDevice),
+    section('new', 'New On Server', 'Недавно добавленные файлы на Orange Pi', newOnDevice),
   ].filter((item) => item.tracks.length > 0)
 }
 

@@ -14,20 +14,26 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.URLEncoder
 import java.io.File
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 
 data class AppUpdateState(
     val currentVersionName: String,
     val currentVersionCode: Int,
     val githubRepo: String = "",
+    val serverBaseUrl: String? = null,
     val latestRelease: AppReleaseInfo? = null,
     val checking: Boolean = false,
     val downloading: Boolean = false,
+    val installing: Boolean = false,
+    val downloadProgress: Float? = null, // null => unknown length => indeterminate
     val message: String? = null,
 ) {
     val updateAvailable: Boolean
@@ -80,6 +86,9 @@ class AppUpdateManager(
                 githubRepo = repo,
                 checking = true,
                 message = if (repo.isBlank()) "Укажи GitHub repo в формате owner/repo" else null,
+                downloading = false,
+                installing = false,
+                downloadProgress = null,
             )
         }
         if (repo.isBlank()) {
@@ -89,8 +98,9 @@ class AppUpdateManager(
         runCatching {
             val endpoint = server.pickEndpoint(preferences.lanUrlOnce(), preferences.tailscaleUrlOnce())
                 ?: error("Orange Pi недоступен и по LAN, и по Tailscale")
-            server.latestRelease(endpoint.baseUrl, repo)
-        }.onSuccess { release ->
+            val release = server.latestRelease(endpoint.baseUrl, repo)
+            endpoint.baseUrl to release
+        }.onSuccess { (baseUrl, release) ->
             val status = when {
                 release.versionCode == null -> "В релизе нет versionCode. Используй тег вида v1.2.0+12."
                 release.apkUrl.isNullOrBlank() -> "В последнем релизе не найден APK asset."
@@ -99,6 +109,7 @@ class AppUpdateManager(
             }
             _state.update {
                 it.copy(
+                    serverBaseUrl = baseUrl,
                     latestRelease = release,
                     checking = false,
                     message = status,
@@ -117,28 +128,72 @@ class AppUpdateManager(
 
     suspend fun downloadAndInstall() {
         val release = state.value.latestRelease ?: error("Сначала проверь обновления")
-        val apkUrl = release.apkUrl ?: error("В релизе нет APK")
         val fileName = release.apkFileName?.takeIf { it.endsWith(".apk", ignoreCase = true) } ?: "music-update.apk"
-        _state.update { it.copy(downloading = true, message = "Скачиваю ${release.versionName ?: release.tagName}…") }
+        val targetVersionCode = release.versionCode ?: error("В релизе нет versionCode (нельзя установить и перезапустить приложение)")
+        val baseUrl = state.value.serverBaseUrl ?: error("Orange Pi baseUrl не найден. Сначала проверь обновления.")
+        val encodedRepo = URLEncoder.encode(release.repo, StandardCharsets.UTF_8.name())
+        val apkUrl = "${baseUrl}/api/apk/latest?repo=$encodedRepo"
+        _state.update {
+            it.copy(
+                downloading = true,
+                installing = false,
+                downloadProgress = null,
+                message = "Скачиваю ${release.versionName ?: release.tagName}…",
+            )
+        }
         runCatching {
             val targetDir = File(context.cacheDir, "updates").apply { mkdirs() }
             val targetFile = File(targetDir, fileName)
-            val request = Request.Builder().url(apkUrl).get().build()
-            http.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) error("Не удалось скачать APK: ${response.code}")
-                val body = response.body ?: error("Пустой ответ при скачивании APK")
-                targetFile.outputStream().use { output ->
-                    body.byteStream().use { input -> input.copyTo(output) }
+            withContext(Dispatchers.IO) {
+                val request = Request.Builder().url(apkUrl).get().build()
+                http.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) error("Не удалось скачать APK: ${response.code}")
+
+                    val body = response.body ?: error("Пустой ответ при скачивании APK")
+                    val totalBytes = body.contentLength()
+                    var downloadedBytes = 0L
+
+                    targetFile.outputStream().use { output ->
+                        body.byteStream().use { input ->
+                            val buffer = ByteArray(64 * 1024)
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read <= 0) break
+                                output.write(buffer, 0, read)
+                                downloadedBytes += read
+
+                                val progress = if (totalBytes > 0) {
+                                    (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
+                                } else {
+                                    null
+                                }
+                                _state.update { it.copy(downloadProgress = progress) }
+                            }
+                        }
+                    }
                 }
+            }
+
+            preferences.setPendingUpdateRestart(targetVersionCode)
+            _state.update {
+                it.copy(
+                    downloading = false,
+                    installing = true,
+                    downloadProgress = 1f,
+                    message = "APK скачан. Открываю установщик…",
+                )
             }
             openInstaller(targetFile)
         }.onSuccess {
-            _state.update { it.copy(downloading = false, message = "APK скачан. Открываю установщик…") }
+            // Фактическая “установка” произойдёт в системном UI.
+            // Мы перезапустим приложение, когда пользователь вернётся назад.
         }.onFailure { error ->
             _state.update {
                 it.copy(
                     downloading = false,
-                    message = error.message ?: "Не удалось скачать обновление",
+                    installing = false,
+                    downloadProgress = null,
+                    message = error.message ?: (error.toString().ifBlank { "Не удалось скачать обновление" }),
                 )
             }
         }

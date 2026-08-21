@@ -40,7 +40,11 @@ class LibraryRepository(
                     if (cached.isNotEmpty()) {
                         _tracks.value = cached
                     }
-                    scan(Uri.parse(uriString), showLoading = cached.isEmpty())
+                    scan(
+                        uri = Uri.parse(uriString),
+                        cachedByRelativePath = cached.associateBy { it.relativePath.lowercase() },
+                        showLoading = cached.isEmpty(),
+                    )
                 } else {
                     _tracks.value = emptyList()
                 }
@@ -63,13 +67,22 @@ class LibraryRepository(
         preferences.setFolderUri(uri.toString())
     }
 
-    suspend fun scan(uri: Uri? = null, showLoading: Boolean = true) {
+    suspend fun scan(
+        uri: Uri? = null,
+        cachedByRelativePath: Map<String, Track> = emptyMap(),
+        showLoading: Boolean = true,
+    ) {
         val folder = uri ?: preferences.folderUriOnce()?.let(Uri::parse) ?: return
         val folderString = folder.toString()
         _isScanning.value = showLoading
         _error.value = null
         try {
-            val result = withContext(Dispatchers.IO) { scanner.scan(folder) }
+            val cachedMap = if (cachedByRelativePath.isNotEmpty()) {
+                cachedByRelativePath
+            } else {
+                preferences.cachedTracks(folderString).associateBy { it.relativePath.lowercase() }
+            }
+            val result = withContext(Dispatchers.IO) { scanner.scan(folder, cachedMap) }
             _tracks.value = result
             preferences.saveCachedTracks(folderString, result)
         } catch (e: SecurityException) {

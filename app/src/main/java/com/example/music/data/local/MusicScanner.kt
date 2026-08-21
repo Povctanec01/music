@@ -11,10 +11,13 @@ import kotlinx.coroutines.withContext
 
 class MusicScanner(private val context: Context) {
 
-    suspend fun scan(treeUri: Uri): List<Track> = withContext(Dispatchers.IO) {
+    suspend fun scan(
+        treeUri: Uri,
+        cachedTracksByRelativePath: Map<String, Track> = emptyMap(),
+    ): List<Track> = withContext(Dispatchers.IO) {
         val tracks = mutableListOf<Track>()
         val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
-        walk(treeUri, treeDocId, "", tracks)
+        walk(treeUri, treeDocId, "", tracks, cachedTracksByRelativePath)
         tracks.sortedWith(
             compareBy<Track, String>(String.CASE_INSENSITIVE_ORDER) { it.artist }
                 .thenBy(String.CASE_INSENSITIVE_ORDER) { it.album }
@@ -28,6 +31,7 @@ class MusicScanner(private val context: Context) {
         documentId: String,
         relativeDir: String,
         out: MutableList<Track>,
+        cachedTracksByRelativePath: Map<String, Track>,
     ) {
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId)
         val projection = arrayOf(
@@ -52,10 +56,18 @@ class MusicScanner(private val context: Context) {
                 val modified = if (cursor.isNull(modifiedIdx)) 0L else cursor.getLong(modifiedIdx)
                 val childRel = if (relativeDir.isEmpty()) name else "$relativeDir/$name"
                 if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                    walk(treeUri, id, childRel, out)
+                    walk(treeUri, id, childRel, out, cachedTracksByRelativePath)
                 } else if (AudioFormats.isAudio(mime, name)) {
                     val uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
-                    out += readMetadata(uri, name, mime.orEmpty(), childRel, size, modified)
+                    out += readMetadata(
+                        uri = uri,
+                        displayName = name,
+                        mime = mime.orEmpty(),
+                        relativePath = childRel,
+                        size = size,
+                        lastModified = modified,
+                        cachedTracksByRelativePath = cachedTracksByRelativePath,
+                    )
                 }
             }
         }
@@ -68,8 +80,22 @@ class MusicScanner(private val context: Context) {
         relativePath: String,
         size: Long,
         lastModified: Long,
+        cachedTracksByRelativePath: Map<String, Track>,
     ): Track {
         val fallbackTitle = displayName.substringBeforeLast('.')
+
+        // Пропускаем MediaMetadataRetriever, если файл не изменился с прошлого скана.
+        val cacheKey = relativePath.replace('\\', '/').lowercase()
+        val cached = cachedTracksByRelativePath[cacheKey]
+        if (cached != null && cached.size == size && cached.addedAt == lastModified) {
+            return cached.copy(
+                id = uri.toString(),
+                uri = uri,
+                displayName = displayName,
+                relativePath = relativePath.replace('\\', '/'),
+            )
+        }
+
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(context, uri)

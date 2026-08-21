@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -47,17 +48,22 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.music.domain.formatDuration
 import com.example.music.domain.model.GroupMode
 import com.example.music.domain.model.LibraryRow
@@ -76,8 +82,25 @@ fun LibraryScreen(
     val player by viewModel.playback.state.collectAsStateWithLifecycle()
     var searchOpen by remember { mutableStateOf(false) }
     var sortMenu by remember { mutableStateOf(false) }
+    var swapFrom by remember { mutableStateOf<GroupMode?>(null) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         uri?.let(viewModel::selectFolder)
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                // When the app is opened/resumed back on this screen:
+                // 1) "Список" should be active first
+                // 2) show "Треки" as the first group chip
+                swapFrom = null
+                viewModel.setBrowseMode(LibraryBrowseMode.LIST)
+                viewModel.setGroup(GroupMode.TRACKS)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     Scaffold(
@@ -135,28 +158,46 @@ fun LibraryScreen(
             ) {
                 item {
                     FilterChip(
-                        selected = state.browseMode == LibraryBrowseMode.HOME,
-                        onClick = { viewModel.setBrowseMode(LibraryBrowseMode.HOME) },
-                        label = { Text("Главная") },
-                    )
-                }
-                item {
-                    FilterChip(
                         selected = state.browseMode == LibraryBrowseMode.LIST,
                         onClick = { viewModel.setBrowseMode(LibraryBrowseMode.LIST) },
                         label = { Text("Список") },
                     )
                 }
-                items(GroupMode.entries) { mode ->
+                item {
+                    FilterChip(
+                        selected = state.browseMode == LibraryBrowseMode.HOME,
+                        onClick = { viewModel.setBrowseMode(LibraryBrowseMode.HOME) },
+                        label = { Text("Главная") },
+                    )
+                }
+                items(state.groupOrder, key = { it.name }) { mode ->
                     FilterChip(
                         selected = state.groupMode == mode,
+                        modifier = Modifier.pointerInput(mode) {
+                            detectTapGestures(
+                                onLongPress = { swapFrom = mode },
+                            )
+                        },
                         onClick = {
+                            if (swapFrom != null && swapFrom != mode) {
+                                viewModel.swapGroupOrder(swapFrom!!, mode)
+                            }
+                            swapFrom = null
                             viewModel.setBrowseMode(LibraryBrowseMode.LIST)
                             viewModel.setGroup(mode)
                         },
                         label = { Text(mode.label()) },
                     )
                 }
+            }
+
+            if (swapFrom != null) {
+                Text(
+                    "Долгое нажатие выбрало вкладку для обмена. Нажмите другую.",
+                    modifier = Modifier.padding(start = 16.dp, top = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             when {

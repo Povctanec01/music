@@ -25,9 +25,10 @@ data class LibraryUiState(
     val isScanning: Boolean = false,
     val error: String? = null,
     val query: String = "",
-    val browseMode: LibraryBrowseMode = LibraryBrowseMode.HOME,
+    val browseMode: LibraryBrowseMode = LibraryBrowseMode.LIST,
     val sortMode: SortMode = SortMode.ARTIST,
     val groupMode: GroupMode = GroupMode.TRACKS,
+    val groupOrder: List<GroupMode> = GroupMode.entries.toList(),
     val favorites: Set<String> = emptySet(),
     val recommendationSections: List<RecommendationSection> = emptyList(),
     val rows: List<LibraryRow> = emptyList(),
@@ -52,9 +53,10 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     val playback = container.playbackController
 
     private val query = MutableStateFlow("")
-    private val browseMode = MutableStateFlow(LibraryBrowseMode.HOME)
+    private val browseMode = MutableStateFlow(LibraryBrowseMode.LIST)
     private val sortMode = MutableStateFlow(SortMode.ARTIST)
     private val groupMode = MutableStateFlow(GroupMode.TRACKS)
+    private val groupOrder = MutableStateFlow(GroupMode.entries.toList())
 
     private val core = combine(
         combine(
@@ -78,32 +80,47 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         base.copy(listeningBehavior = listeningBehavior)
     }
 
-    val uiState: StateFlow<LibraryUiState> = combine(core, query, browseMode, sortMode, groupMode) { core: LibraryCore, q: String, mode: LibraryBrowseMode, sort: SortMode, group: GroupMode ->
-        val filtered = filterAndSort(core.tracks, q, sort, group, core.favorites)
-        LibraryUiState(
-            folderSelected = !core.folderUri.isNullOrBlank(),
-            isScanning = core.isScanning,
-            error = core.error,
-            query = q,
-            browseMode = mode,
-            sortMode = sort,
-            groupMode = group,
-            favorites = core.favorites,
-            recommendationSections = if (q.isBlank()) {
-                recommendationEngine.buildSections(core.tracks, core.listeningBehavior, core.favorites)
-            } else {
-                emptyList()
-            },
-            rows = buildRows(filtered, group),
-            visibleTracks = filtered,
-            totalCount = core.tracks.size,
-        )
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LibraryUiState())
+    private val uiStateBase =
+        combine(core, query, browseMode, sortMode, groupMode) { core: LibraryCore, q: String, mode: LibraryBrowseMode, sort: SortMode, group: GroupMode ->
+            val filtered = filterAndSort(core.tracks, q, sort, group, core.favorites)
+            LibraryUiState(
+                folderSelected = !core.folderUri.isNullOrBlank(),
+                isScanning = core.isScanning,
+                error = core.error,
+                query = q,
+                browseMode = mode,
+                sortMode = sort,
+                groupMode = group,
+                favorites = core.favorites,
+                recommendationSections = if (q.isBlank()) {
+                    recommendationEngine.buildSections(core.tracks, core.listeningBehavior, core.favorites)
+                } else {
+                    emptyList()
+                },
+                rows = buildRows(filtered, group),
+                visibleTracks = filtered,
+                totalCount = core.tracks.size,
+            )
+        }
+
+    val uiState: StateFlow<LibraryUiState> =
+        combine(uiStateBase, groupOrder) { base, order ->
+            base.copy(groupOrder = order)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LibraryUiState())
 
     init {
         viewModelScope.launch {
             library.tracks.collect { tracks ->
                 playback.restoreIfNeeded(tracks)
+            }
+        }
+        viewModelScope.launch {
+            // Restore previously selected sorting mode.
+            sortMode.value = preferences.sortModeOnce()
+        }
+        viewModelScope.launch {
+            preferences.groupModeOrder.collect { order ->
+                groupOrder.value = order
             }
         }
     }
@@ -118,10 +135,24 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     fun setSort(mode: SortMode) {
         sortMode.value = mode
+        viewModelScope.launch { preferences.setSortMode(mode) }
     }
 
     fun setGroup(mode: GroupMode) {
         groupMode.value = mode
+    }
+
+    fun swapGroupOrder(a: GroupMode, b: GroupMode) {
+        if (a == b) return
+        val current = groupOrder.value.toMutableList()
+        val i = current.indexOf(a)
+        val j = current.indexOf(b)
+        if (i == -1 || j == -1) return
+        val tmp = current[i]
+        current[i] = current[j]
+        current[j] = tmp
+        groupOrder.value = current
+        viewModelScope.launch { preferences.setGroupModeOrder(current) }
     }
 
     fun refresh() {

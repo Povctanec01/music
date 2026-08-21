@@ -11,6 +11,8 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.music.domain.model.DownloadNetworkMode
+import com.example.music.domain.model.GroupMode
+import com.example.music.domain.model.SortMode
 import com.example.music.domain.model.Track
 import com.example.music.domain.recommendation.TrackBehavior
 import kotlinx.coroutines.flow.Flow
@@ -40,6 +42,20 @@ class AppPreferences(
     }
     val shuffle: Flow<Boolean> = dataStore.data.map { it[Keys.SHUFFLE] ?: false }
     val repeatMode: Flow<Int> = dataStore.data.map { it[Keys.REPEAT_MODE] ?: 0 }
+    val sortMode: Flow<SortMode> = dataStore.data.map { prefs ->
+        runCatching { SortMode.valueOf(prefs[Keys.SORT_MODE] ?: SortMode.ARTIST.name) }
+            .getOrDefault(SortMode.ARTIST)
+    }
+    val groupModeOrder: Flow<List<GroupMode>> = dataStore.data.map { prefs ->
+        val raw = prefs[Keys.GROUP_MODE_ORDER].orEmpty()
+        if (raw.isBlank()) GroupMode.entries.toList()
+        else runCatching {
+            normalizeGroupModeOrder(
+                json.decodeFromString<List<String>>(raw)
+                    .mapNotNull { token -> runCatching { GroupMode.valueOf(token) }.getOrNull() },
+            )
+        }.getOrDefault(GroupMode.entries.toList())
+    }
     val favorites: Flow<Set<String>> = dataStore.data.map { prefs ->
         val raw = prefs[Keys.FAVORITES].orEmpty()
         if (raw.isBlank()) emptySet()
@@ -58,6 +74,8 @@ class AppPreferences(
     suspend fun networkModeOnce(): DownloadNetworkMode = downloadNetworkMode.first()
     suspend fun favoritesOnce(): Set<String> = favorites.first()
     suspend fun listeningBehaviorOnce(): Map<String, TrackBehavior> = listeningBehavior.first()
+    suspend fun sortModeOnce(): SortMode = sortMode.first()
+    suspend fun groupModeOrderOnce(): List<GroupMode> = groupModeOrder.first()
 
     suspend fun setFolderUri(uri: String) {
         dataStore.edit { it[Keys.FOLDER_URI] = uri }
@@ -85,6 +103,17 @@ class AppPreferences(
 
     suspend fun setRepeatMode(mode: Int) {
         dataStore.edit { it[Keys.REPEAT_MODE] = mode }
+    }
+
+    suspend fun setSortMode(mode: SortMode) {
+        dataStore.edit { it[Keys.SORT_MODE] = mode.name }
+    }
+
+    suspend fun setGroupModeOrder(order: List<GroupMode>) {
+        val raw = json.encodeToString(normalizeGroupModeOrder(order).map { it.name })
+        dataStore.edit { prefs ->
+            prefs[Keys.GROUP_MODE_ORDER] = raw
+        }
     }
 
     suspend fun toggleFavorite(trackId: String): Boolean {
@@ -178,6 +207,26 @@ class AppPreferences(
         dataStore.edit { it[Keys.CACHED_LIBRARY] = json.encodeToString(snapshot) }
     }
 
+    val pendingUpdateRestart: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[Keys.PENDING_UPDATE_RESTART] ?: false
+    }
+
+    suspend fun pendingUpdateRestartOnce(): Boolean = pendingUpdateRestart.first()
+
+    suspend fun setPendingUpdateRestart(targetVersionCode: Int) {
+        dataStore.edit { prefs ->
+            prefs[Keys.PENDING_UPDATE_RESTART] = true
+            prefs[Keys.PENDING_UPDATE_TARGET_VERSION_CODE] = targetVersionCode
+        }
+    }
+
+    suspend fun clearPendingUpdateRestart() {
+        dataStore.edit { prefs ->
+            prefs[Keys.PENDING_UPDATE_RESTART] = false
+            prefs.remove(Keys.PENDING_UPDATE_TARGET_VERSION_CODE)
+        }
+    }
+
     private suspend fun mutateTrackBehavior(
         trackId: String,
         update: (TrackBehavior) -> TrackBehavior,
@@ -203,6 +252,8 @@ class AppPreferences(
         val NETWORK_MODE = stringPreferencesKey("network_mode")
         val SHUFFLE = booleanPreferencesKey("shuffle")
         val REPEAT_MODE = intPreferencesKey("repeat_mode")
+        val SORT_MODE = stringPreferencesKey("sort_mode")
+        val GROUP_MODE_ORDER = stringPreferencesKey("group_mode_order")
         val FAVORITES = stringPreferencesKey("favorites")
         val QUEUE = stringPreferencesKey("queue")
         val QUEUE_INDEX = intPreferencesKey("queue_index")
@@ -210,12 +261,21 @@ class AppPreferences(
         val LAST_MEDIA_ID = stringPreferencesKey("last_media_id")
         val LISTENING_BEHAVIOR = stringPreferencesKey("listening_behavior")
         val CACHED_LIBRARY = stringPreferencesKey("cached_library")
+        val PENDING_UPDATE_RESTART = booleanPreferencesKey("pending_update_restart")
+        val PENDING_UPDATE_TARGET_VERSION_CODE = intPreferencesKey("pending_update_target_version_code")
     }
 
     companion object {
         const val DEFAULT_LAN_URL = "http://192.168.1.80:8080"
         const val DEFAULT_TAILSCALE_URL = "http://100.106.26.26:8080"
         const val DEFAULT_GITHUB_REPO = "Povctanec01/music"
+
+        fun normalizeGroupModeOrder(order: List<GroupMode>): List<GroupMode> {
+            val seen = linkedSetOf<GroupMode>()
+            order.forEach { mode -> seen.add(mode) }
+            GroupMode.entries.forEach { mode -> seen.add(mode) }
+            return seen.toList()
+        }
     }
 }
 

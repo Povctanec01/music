@@ -9,6 +9,7 @@ export type MusicTrack = {
   size: number
   relativePath: string
   source: TrackSource
+  addedAt: number
   artUrl?: string
   objectUrl?: string
   remoteUrl?: string

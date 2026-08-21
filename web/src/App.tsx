@@ -1,24 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { NavLink, Route, Routes } from 'react-router-dom'
-import { parseBlob } from 'music-metadata-browser'
+import { NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import './App.css'
+import { favoriteTracks, groupTracks, LIBRARY_TABS, SORT_MODES, sortTracks, type LibraryTab, type SortMode, formatRelativeAddedAt, groupNewestAddedAt } from './library'
 import { buildRecommendationSections, emptyBehavior } from './recommendations'
 import {
   loadBehavior,
   loadFavorites,
   loadGithubRepo,
+  loadLibraryTab,
   loadServerUrl,
+  loadSortMode,
   saveBehavior,
   saveFavorites,
   saveGithubRepo,
+  saveLibraryTab,
   saveServerUrl,
+  saveSortMode,
 } from './storage'
 import type { ListeningBehavior, MusicTrack, RecommendationSection, ReleaseInfo } from './types'
 
 function App() {
   const [serverUrl, setServerUrl] = useState(loadServerUrl)
   const [githubRepo, setGithubRepo] = useState(loadGithubRepo)
-  const [localTracks, setLocalTracks] = useState<MusicTrack[]>([])
   const [remoteTracks, setRemoteTracks] = useState<MusicTrack[]>([])
   const [favorites, setFavorites] = useState<Set<string>>(new Set(loadFavorites()))
   const [behavior, setBehavior] = useState<Record<string, ListeningBehavior>>(loadBehavior())
@@ -27,19 +30,32 @@ function App() {
   const [isPlaying, setIsPlaying] = useState(false)
   const [positionMs, setPositionMs] = useState(0)
   const [durationMs, setDurationMs] = useState(0)
-  const [loadingLocal, setLoadingLocal] = useState(false)
   const [loadingRemote, setLoadingRemote] = useState(false)
   const [loadingRelease, setLoadingRelease] = useState(false)
   const [latestRelease, setLatestRelease] = useState<ReleaseInfo | null>(null)
-  const [status, setStatus] = useState('Выбери локальную папку или обнови библиотеку Orange Pi.')
+  const [status, setStatus] = useState('Загружаю библиотеку с Orange Pi…')
   const [uploadDir, setUploadDir] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [libraryTab, setLibraryTab] = useState<LibraryTab>(() => {
+    const saved = loadLibraryTab()
+    return LIBRARY_TABS.some((tab) => tab.id === saved) ? (saved as LibraryTab) : 'tracks'
+  })
+  const [sortMode, setSortMode] = useState<SortMode>(() => {
+    const saved = loadSortMode()
+    return SORT_MODES.some((mode) => mode.id === saved) ? (saved as SortMode) : 'date_added'
+  })
+  const [expandedGroup, setExpandedGroup] = useState<string | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const location = useLocation()
   const lastTrackedPosition = useRef(0)
   const pendingListenedMs = useRef(0)
-  const allTracks = useMemo(() => dedupeTracks([...localTracks, ...remoteTracks]), [localTracks, remoteTracks])
   const sections = useMemo(
-    () => buildRecommendationSections(allTracks, behavior, favorites),
-    [allTracks, behavior, favorites],
+    () => buildRecommendationSections(remoteTracks, behavior, favorites),
+    [remoteTracks, behavior, favorites],
+  )
+  const visibleTracks = useMemo(
+    () => sortTracks(filterTracks(remoteTracks, searchQuery), sortMode),
+    [remoteTracks, searchQuery, sortMode],
   )
   const currentIndex = queue.findIndex((track) => track.id === currentId)
   const currentTrack = currentIndex >= 0 ? queue[currentIndex] : null
@@ -61,9 +77,17 @@ function App() {
   }, [behavior])
 
   useEffect(() => {
+    saveLibraryTab(libraryTab)
+  }, [libraryTab])
+
+  useEffect(() => {
+    saveSortMode(sortMode)
+  }, [sortMode])
+
+  useEffect(() => {
     void refreshRemoteLibrary()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [serverUrl])
 
   useEffect(() => {
     if (!githubRepo.trim()) {
@@ -141,51 +165,13 @@ function App() {
     }
   }, [currentTrack, durationMs])
 
-  async function chooseLocalFolder() {
-    const picker = (window as Window & { showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle> })
-      .showDirectoryPicker
-    if (!picker) {
-      setStatus('В этом браузере нет выбора папки. Используй импорт файлов ниже.')
-      return
-    }
-    setLoadingLocal(true)
-    setStatus('Сканирую локальную папку…')
-    try {
-      const handle = await picker()
-      const files = await scanDirectory(handle)
-      setLocalTracks(files)
-      setStatus(`Локально найдено ${files.length} треков.`)
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Не удалось открыть папку')
-    } finally {
-      setLoadingLocal(false)
-    }
-  }
-
-  async function importFiles(files: FileList | null) {
-    if (!files?.length) return
-    setLoadingLocal(true)
-    setStatus('Импортирую выбранные файлы…')
-    try {
-      const tracks = await Promise.all(
-        [...files]
-          .filter((file) => isAudioFile(file.name))
-          .map((file) => createTrackFromFile(file, file.name)),
-      )
-      setLocalTracks(tracks)
-      setStatus(`Импортировано ${tracks.length} локальных треков.`)
-    } finally {
-      setLoadingLocal(false)
-    }
-  }
-
   async function refreshRemoteLibrary() {
     setLoadingRemote(true)
     try {
       const response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/library`)
       if (!response.ok) throw new Error(`Orange Pi API: ${response.status}`)
-      const payload = (await response.json()) as { files: Array<{ path: string; size: number }> }
-      const tracks = payload.files.map((item) => createRemoteTrack(item.path, item.size, serverUrl))
+      const payload = (await response.json()) as { files: Array<{ path: string; size: number; mtime: number }> }
+      const tracks = payload.files.map((item) => createRemoteTrack(item.path, item.size, item.mtime, serverUrl))
       setRemoteTracks(tracks)
       setStatus(`На Orange Pi найдено ${tracks.length} файлов.`)
     } catch (error) {
@@ -297,140 +283,204 @@ function App() {
     setPositionMs(next)
   }
 
+  const pageMeta = pageTitle(location.pathname)
+
   return (
-    <div className="app-shell">
+    <div className="app-layout">
       <audio ref={audioRef} preload="metadata" />
-      <header className="hero-card">
-        <div>
-          <p className="eyebrow">Music Web</p>
-          <h1>Веб-плеер для локальной музыки и Orange Pi</h1>
-          <p className="subtitle">
-            Локальная библиотека, проигрывание, рекомендации, загрузка и скачивание в одном PWA.
-          </p>
-          <div className="hero-links">
-            <a href={`${serverUrl.replace(/\/$/, '')}/api/health`} target="_blank" rel="noreferrer">
-              API health
+
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">♪</div>
+          <div className="brand-copy">
+            <strong>Music Web</strong>
+            <span>Orange Pi</span>
+          </div>
+        </div>
+
+        <nav className="sidebar-nav">
+          <NavLink to="/" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+            <span className="nav-icon">🏠</span>
+            Главная
+          </NavLink>
+          <NavLink to="/sync" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+            <span className="nav-icon">☁️</span>
+            Синк
+          </NavLink>
+          <NavLink to="/settings" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+            <span className="nav-icon">⚙️</span>
+            Настройки
+          </NavLink>
+        </nav>
+
+        <div className="sidebar-stats">
+          <div className="mini-stat">
+            <span>На сервере</span>
+            <strong>{remoteTracks.length}</strong>
+          </div>
+          <div className="mini-stat">
+            <span>Избранное</span>
+            <strong>{favorites.size}</strong>
+          </div>
+          {latestRelease?.apkUrl ? (
+            <a className="btn btn-primary apk-promo" href={latestRelease.apkUrl} target="_blank" rel="noreferrer">
+              Скачать APK
             </a>
-            <a href={`${serverUrl.replace(/\/$/, '')}/api/library`} target="_blank" rel="noreferrer">
-              Библиотека
-            </a>
-            {latestRelease?.apkUrl ? (
-              <a href={latestRelease.apkUrl} target="_blank" rel="noreferrer">
-                Скачать APK
-              </a>
+          ) : null}
+        </div>
+      </aside>
+
+      <div className="main-column">
+        <header className="page-header">
+          <div>
+            <h1>{pageMeta.title}</h1>
+            <p>{pageMeta.subtitle}</p>
+          </div>
+          <div className="header-actions">
+            {location.pathname === '/' ? (
+              <button type="button" className="btn btn-primary" onClick={() => void refreshRemoteLibrary()}>
+                {loadingRemote ? 'Обновление…' : 'Обновить библиотеку'}
+              </button>
+            ) : null}
+            {location.pathname === '/sync' ? (
+              <button type="button" className="btn btn-primary" onClick={() => void refreshRemoteLibrary()}>
+                {loadingRemote ? 'Обновление…' : 'Обновить библиотеку'}
+              </button>
             ) : null}
           </div>
-          <p className="subtitle">
-            {githubRepo.trim()
-              ? loadingRelease
-                ? 'Проверяю последнюю APK-версию…'
-                : latestRelease?.versionName
-                  ? `Последняя версия Android: ${latestRelease.versionName} (${latestRelease.versionCode ?? '?'})`
-                  : 'Укажи корректный GitHub release с APK и тегом вида v1.2.0+12.'
-              : 'Укажи GitHub repo в настройках, чтобы включить APK-обновления.'}
-          </p>
-        </div>
-        <div className="hero-stats">
-          <StatCard label="Локально" value={String(localTracks.length)} />
-          <StatCard label="Orange Pi" value={String(remoteTracks.length)} />
-          <StatCard label="Избранное" value={String(favorites.size)} />
-        </div>
-      </header>
+        </header>
 
-      <nav className="top-nav">
-        <NavLink to="/">Главная</NavLink>
-        <NavLink to="/sync">Синк</NavLink>
-        <NavLink to="/settings">Настройки</NavLink>
+        {(location.pathname === '/' || location.pathname === '/sync') && (
+          <div className="search-bar">
+            <input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="Поиск по названию, исполнителю, альбому…"
+            />
+            <SortSelect value={sortMode} onChange={setSortMode} />
+          </div>
+        )}
+
+        <Routes>
+          <Route
+            path="/"
+            element={
+              <HomePage
+                libraryTracks={visibleTracks}
+                sections={sections.map((section) => ({
+                  ...section,
+                  tracks: filterTracks(section.tracks, searchQuery),
+                })).filter((section) => section.tracks.length > 0)}
+                libraryTab={libraryTab}
+                sortMode={sortMode}
+                expandedGroup={expandedGroup}
+                currentId={currentId}
+                favorites={favorites}
+                latestRelease={latestRelease}
+                loadingRelease={loadingRelease}
+                loadingLibrary={loadingRemote}
+                onLibraryTabChange={setLibraryTab}
+                onExpandedGroupChange={setExpandedGroup}
+                onToggleFavorite={toggleFavorite}
+                onPlay={(track, tracks) => playSelection(track, tracks)}
+              />
+            }
+          />
+          <Route
+            path="/sync"
+            element={
+              <SyncPage
+                serverUrl={serverUrl}
+                remoteTracks={visibleTracks}
+                sortMode={sortMode}
+                loadingRemote={loadingRemote}
+                uploadDir={uploadDir}
+                onUploadDirChange={setUploadDir}
+                onUpload={uploadFiles}
+                onPlay={(track, tracks) => playSelection(track, tracks ?? remoteTracks)}
+                onToggleFavorite={toggleFavorite}
+                currentId={currentId}
+                favorites={favorites}
+              />
+            }
+          />
+          <Route
+            path="/settings"
+            element={
+              <SettingsPage
+                serverUrl={serverUrl}
+                githubRepo={githubRepo}
+                latestRelease={latestRelease}
+                onServerUrlChange={setServerUrl}
+                onGithubRepoChange={setGithubRepo}
+                onRefresh={refreshRemoteLibrary}
+                onRefreshRelease={fetchLatestRelease}
+              />
+            }
+          />
+        </Routes>
+      </div>
+
+      <nav className="mobile-nav">
+        <NavLink to="/" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+          <span className="nav-icon">🏠</span>
+          Главная
+        </NavLink>
+        <NavLink to="/sync" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+          <span className="nav-icon">☁️</span>
+          Синк
+        </NavLink>
+        <NavLink to="/settings" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+          <span className="nav-icon">⚙️</span>
+          Настройки
+        </NavLink>
       </nav>
 
-      <p className="status-line">{status}</p>
-
-      <Routes>
-        <Route
-          path="/"
-          element={
-            <HomePage
-              localTracks={localTracks}
-              sections={sections}
-              currentId={currentId}
-              favorites={favorites}
-              latestRelease={latestRelease}
-              loadingRelease={loadingRelease}
-              onPickFolder={chooseLocalFolder}
-              onImportFiles={importFiles}
-              onToggleFavorite={toggleFavorite}
-              onPlay={(track, tracks) => playSelection(track, tracks)}
-              loadingLocal={loadingLocal}
-            />
-          }
-        />
-        <Route
-          path="/sync"
-          element={
-            <SyncPage
-              serverUrl={serverUrl}
-              remoteTracks={remoteTracks}
-              loadingRemote={loadingRemote}
-              uploadDir={uploadDir}
-              onUploadDirChange={setUploadDir}
-              onRefresh={refreshRemoteLibrary}
-              onUpload={uploadFiles}
-              onPlay={(track) => playSelection(track, remoteTracks)}
-            />
-          }
-        />
-        <Route
-          path="/settings"
-          element={
-            <SettingsPage
-              serverUrl={serverUrl}
-              githubRepo={githubRepo}
-              onServerUrlChange={setServerUrl}
-              onGithubRepoChange={setGithubRepo}
-              onRefresh={refreshRemoteLibrary}
-              onRefreshRelease={fetchLatestRelease}
-            />
-          }
-        />
-      </Routes>
+      {status ? <div className="toast">{status}</div> : null}
 
       {currentTrack ? (
-        <footer className="player-panel">
-          <div className="player-main">
-            <div className="cover-tile">{(currentTrack.title[0] ?? '♪').toUpperCase()}</div>
-            <div className="player-meta">
-              <strong>{currentTrack.title}</strong>
-              <span>{currentTrack.artist || 'Неизвестный исполнитель'}</span>
+        <footer className="player-bar">
+          <div className="player-inner">
+            <div className="player-top">
+              <div className="cover-tile">
+                <TrackArt track={currentTrack} className="cover-image" />
+              </div>
+              <div className="player-meta">
+                <strong>{currentTrack.title}</strong>
+                <span>{currentTrack.artist || 'Неизвестный исполнитель'}</span>
+              </div>
+              <div className="player-controls">
+                <button type="button" className="player-btn player-btn-icon" onClick={playPrevious} aria-label="Назад">
+                  ⏮
+                </button>
+                <button type="button" className="player-btn player-btn-play" onClick={togglePlayback} aria-label="Play/Pause">
+                  {isPlaying ? '⏸' : '▶'}
+                </button>
+                <button
+                  type="button"
+                  className="player-btn player-btn-icon"
+                  aria-label="Далее"
+                  onClick={() => {
+                    maybeRecordSkip()
+                    playNext()
+                  }}
+                >
+                  ⏭
+                </button>
+              </div>
             </div>
-            <div className="player-controls">
-              <button type="button" onClick={playPrevious}>
-                Назад
-              </button>
-              <button type="button" onClick={togglePlayback}>
-                {isPlaying ? 'Пауза' : 'Играть'}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  maybeRecordSkip()
-                  playNext()
-                }}
-              >
-                Далее
-              </button>
+            <div className="seek-wrap">
+              <span>{formatDuration(positionMs)}</span>
+              <input
+                className="seekbar"
+                type="range"
+                min={0}
+                max={Math.max(durationMs, 1)}
+                value={Math.min(positionMs, Math.max(durationMs, 1))}
+                onChange={seekTo}
+              />
+              <span>{formatDuration(durationMs)}</span>
             </div>
-          </div>
-          <input
-            className="seekbar"
-            type="range"
-            min={0}
-            max={Math.max(durationMs, 1)}
-            value={Math.min(positionMs, Math.max(durationMs, 1))}
-            onChange={seekTo}
-          />
-          <div className="player-times">
-            <span>{formatDuration(positionMs)}</span>
-            <span>{formatDuration(durationMs)}</span>
           </div>
         </footer>
       ) : null}
@@ -441,127 +491,219 @@ function App() {
 export default App
 
 function HomePage(props: {
-  localTracks: MusicTrack[]
+  libraryTracks: MusicTrack[]
   sections: RecommendationSection[]
+  libraryTab: LibraryTab
+  sortMode: SortMode
+  expandedGroup: string | null
   currentId: string | null
   favorites: Set<string>
   latestRelease: ReleaseInfo | null
   loadingRelease: boolean
-  onPickFolder: () => Promise<void>
-  onImportFiles: (files: FileList | null) => Promise<void>
+  loadingLibrary: boolean
+  onLibraryTabChange: (tab: LibraryTab) => void
+  onExpandedGroupChange: (key: string | null) => void
   onToggleFavorite: (trackId: string) => void
   onPlay: (track: MusicTrack, tracks: MusicTrack[]) => void
-  loadingLocal: boolean
 }) {
   const {
-    localTracks,
+    libraryTracks,
     sections,
+    libraryTab,
+    sortMode,
+    expandedGroup,
     currentId,
     favorites,
     latestRelease,
     loadingRelease,
-    onPickFolder,
-    onImportFiles,
+    loadingLibrary,
+    onLibraryTabChange,
+    onExpandedGroupChange,
     onToggleFavorite,
     onPlay,
-    loadingLocal,
   } = props
+
+  const favoriteList = useMemo(
+    () => favoriteTracks(libraryTracks, favorites),
+    [libraryTracks, favorites],
+  )
+  const artistGroups = useMemo(() => groupTracks(libraryTracks, 'artists', sortMode), [libraryTracks, sortMode])
+  const albumGroups = useMemo(() => groupTracks(libraryTracks, 'albums', sortMode), [libraryTracks, sortMode])
+  const folderGroups = useMemo(() => groupTracks(libraryTracks, 'folders', sortMode), [libraryTracks, sortMode])
+
+  const hasContent =
+    libraryTab === 'recommendations'
+      ? sections.length > 0
+      : libraryTab === 'tracks'
+        ? libraryTracks.length > 0
+        : libraryTab === 'favorites'
+          ? favoriteList.length > 0
+          : libraryTab === 'artists'
+            ? artistGroups.length > 0
+            : libraryTab === 'albums'
+              ? albumGroups.length > 0
+              : folderGroups.length > 0
+
+  const activeGroups =
+    libraryTab === 'artists' ? artistGroups : libraryTab === 'albums' ? albumGroups : folderGroups
 
   return (
     <section className="page-grid">
-      <article className="panel">
-        <div className="section-heading">
-          <div>
-            <p className="eyebrow">Android APK</p>
-            <h2>Обновления для телефона</h2>
-          </div>
-          {latestRelease?.apkUrl ? (
-            <a className="secondary-button" href={latestRelease.apkUrl} target="_blank" rel="noreferrer">
+      {latestRelease?.apkUrl ? (
+        <article className="panel apk-promo">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Android</p>
+              <h2>
+                {loadingRelease
+                  ? 'Проверяю версию…'
+                  : `Версия ${latestRelease.versionName ?? latestRelease.tagName}`}
+              </h2>
+            </div>
+            <a className="btn btn-primary" href={latestRelease.apkUrl} target="_blank" rel="noreferrer">
               Скачать APK
             </a>
-          ) : null}
-        </div>
-        <p>
-          {loadingRelease
-            ? 'Проверяю последнюю версию…'
-            : latestRelease?.versionName
-              ? `Последний релиз: ${latestRelease.versionName} (${latestRelease.versionCode ?? '?'})`
-              : 'Добавь GitHub repo в настройках и публикуй APK как release asset.'}
-        </p>
-        {latestRelease?.body ? <p>{latestRelease.body.split('\n').find((line) => line.trim())}</p> : null}
-      </article>
-
-      <article className="panel">
-        <div className="section-heading">
-          <div>
-            <p className="eyebrow">Локальная музыка</p>
-            <h2>Библиотека с ПК</h2>
-          </div>
-          <div className="actions">
-            <button type="button" onClick={() => void onPickFolder()}>
-              Выбрать папку
-            </button>
-            <label className="secondary-button">
-              Импорт файлов
-              <input
-                type="file"
-                accept=".mp3,.flac,.ogg,.opus,.m4a,.aac,.wav"
-                multiple
-                hidden
-                onChange={(event) => void onImportFiles(event.target.files)}
-              />
-            </label>
-          </div>
-        </div>
-        {loadingLocal ? <p>Сканирование локальной папки…</p> : null}
-        {!localTracks.length ? <p>Пока нет локальных треков. Выбери папку или импортируй файлы вручную.</p> : null}
-      </article>
-
-      {sections.map((section) => (
-        <article className="panel" key={section.key}>
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">{section.title}</p>
-              <h2>{section.subtitle}</h2>
-            </div>
-          </div>
-          <div className="card-row">
-            {section.tracks.map((track) => (
-              <TrackCard
-                key={track.id}
-                track={track}
-                active={track.id === currentId}
-                favorite={favorites.has(track.id)}
-                onPlay={() => onPlay(track, section.tracks)}
-                onToggleFavorite={() => onToggleFavorite(track.id)}
-              />
-            ))}
           </div>
         </article>
-      ))}
+      ) : null}
 
-      {!!localTracks.length && (
-        <article className="panel">
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">Все локальные треки</p>
-              <h2>Плотный список для быстрого выбора</h2>
-            </div>
+      <article className="panel library-panel">
+        <div className="library-tabs" role="tablist" aria-label="Разделы библиотеки">
+          {LIBRARY_TABS.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={libraryTab === tab.id}
+              className={`library-tab${libraryTab === tab.id ? ' active' : ''}`}
+              onClick={() => {
+                onLibraryTabChange(tab.id)
+                onExpandedGroupChange(null)
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {loadingLibrary ? (
+          <div className="empty-state">
+            <div className="empty-icon">⏳</div>
+            <p>Загружаю библиотеку с Orange Pi…</p>
           </div>
+        ) : null}
+
+        {!hasContent && !loadingLibrary ? (
+          <div className="empty-state">
+            <div className="empty-icon">🎵</div>
+            <p>
+              {libraryTab === 'favorites'
+                ? 'Пока нет избранных треков. Нажми ♡ у понравившейся песни.'
+                : 'На Orange Pi пока нет музыки. Загрузи файлы во вкладке «Синк» или проверь адрес сервера в настройках.'}
+            </p>
+          </div>
+        ) : null}
+
+        {!loadingLibrary && libraryTab === 'recommendations'
+          ? sections.map((section) => (
+              <div className="library-section" key={section.key}>
+                <div className="section-heading">
+                  <div>
+                    <p className="eyebrow">{section.title}</p>
+                    <h2>{section.subtitle}</h2>
+                  </div>
+                </div>
+                <div className="card-row">
+                  {section.tracks.map((track) => (
+                    <TrackCard
+                      key={track.id}
+                      track={track}
+                      active={track.id === currentId}
+                      favorite={favorites.has(track.id)}
+                      onPlay={() => onPlay(track, section.tracks)}
+                      onToggleFavorite={() => onToggleFavorite(track.id)}
+                    />
+                  ))}
+                </div>
+              </div>
+            ))
+          : null}
+
+        {!loadingLibrary && libraryTab === 'tracks' ? (
           <div className="list">
-            {localTracks.map((track) => (
+            {libraryTracks.map((track) => (
               <TrackRow
                 key={track.id}
                 track={track}
+                sortMode={sortMode}
                 active={track.id === currentId}
                 favorite={favorites.has(track.id)}
-                onPlay={() => onPlay(track, localTracks)}
+                onPlay={() => onPlay(track, libraryTracks)}
                 onToggleFavorite={() => onToggleFavorite(track.id)}
               />
             ))}
           </div>
-        </article>
-      )}
+        ) : null}
+
+        {!loadingLibrary && libraryTab === 'favorites' ? (
+          <div className="list">
+            {favoriteList.map((track) => (
+              <TrackRow
+                key={track.id}
+                track={track}
+                sortMode={sortMode}
+                active={track.id === currentId}
+                favorite
+                onPlay={() => onPlay(track, favoriteList)}
+                onToggleFavorite={() => onToggleFavorite(track.id)}
+              />
+            ))}
+          </div>
+        ) : null}
+
+        {!loadingLibrary && (libraryTab === 'artists' || libraryTab === 'albums' || libraryTab === 'folders')
+          ? activeGroups.map((group) => (
+              <div className="group-block" key={group.key}>
+                <button
+                  type="button"
+                  className="group-card"
+                  onClick={() => onExpandedGroupChange(expandedGroup === group.key ? null : group.key)}
+                >
+                  <TrackArt
+                    track={group.tracks.find((track) => track.artUrl) ?? group.tracks[0]}
+                    className="group-art"
+                    fallback={group.label}
+                  />
+                  <div className="group-copy">
+                    <strong>{group.label}</strong>
+                    <span>
+                      {group.tracks.length} треков
+                      {sortMode === 'date_added'
+                        ? ` • ${formatRelativeAddedAt(groupNewestAddedAt(group.tracks))}`
+                        : ''}
+                    </span>
+                  </div>
+                  <span className="group-chevron">{expandedGroup === group.key ? '▾' : '▸'}</span>
+                </button>
+                {expandedGroup === group.key ? (
+                  <div className="list group-tracks">
+                    {group.tracks.map((track) => (
+                      <TrackRow
+                        key={track.id}
+                        track={track}
+                        sortMode={sortMode}
+                        active={track.id === currentId}
+                        favorite={favorites.has(track.id)}
+                        onPlay={() => onPlay(track, group.tracks)}
+                        onToggleFavorite={() => onToggleFavorite(track.id)}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ))
+          : null}
+      </article>
     </section>
   )
 }
@@ -572,11 +714,26 @@ function SyncPage(props: {
   loadingRemote: boolean
   uploadDir: string
   onUploadDirChange: (value: string) => void
-  onRefresh: () => Promise<void>
   onUpload: (files: FileList | null) => Promise<void>
-  onPlay: (track: MusicTrack) => void
+  onPlay: (track: MusicTrack, tracks?: MusicTrack[]) => void
+  onToggleFavorite: (trackId: string) => void
+  currentId: string | null
+  favorites: Set<string>
+  sortMode: SortMode
 }) {
-  const { serverUrl, remoteTracks, loadingRemote, uploadDir, onUploadDirChange, onRefresh, onUpload, onPlay } = props
+  const {
+    serverUrl,
+    remoteTracks,
+    loadingRemote,
+    uploadDir,
+    onUploadDirChange,
+    onUpload,
+    onPlay,
+    onToggleFavorite,
+    currentId,
+    favorites,
+    sortMode,
+  } = props
 
   return (
     <section className="page-grid">
@@ -586,26 +743,38 @@ function SyncPage(props: {
             <p className="eyebrow">Orange Pi</p>
             <h2>Удалённая библиотека</h2>
           </div>
-          <button type="button" onClick={() => void onRefresh()}>
-            Обновить
-          </button>
         </div>
-        <p>{loadingRemote ? 'Загружаю удалённую библиотеку…' : `Источник: ${serverUrl}`}</p>
+        <p className="subtitle">
+          {loadingRemote ? 'Загружаю список…' : `${remoteTracks.length} треков • ${serverUrl}`}
+        </p>
+        <div className="actions" style={{ marginTop: 12 }}>
+          <a className="secondary-button" href={`${serverUrl.replace(/\/$/, '')}/api/health`} target="_blank" rel="noreferrer">
+            API health
+          </a>
+          <a className="secondary-button" href={`${serverUrl.replace(/\/$/, '')}/api/library`} target="_blank" rel="noreferrer">
+            JSON библиотеки
+          </a>
+        </div>
       </article>
 
       <article className="panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">Upload</p>
-            <h2>Загрузка с ПК на Orange Pi</h2>
+            <p className="eyebrow">Загрузка</p>
+            <h2>Добавить музыку на Orange Pi</h2>
           </div>
         </div>
         <label className="field">
-          Подпапка внутри /srv/music
-          <input value={uploadDir} onChange={(event) => onUploadDirChange(event.target.value)} placeholder="Например: New arrivals/2026" />
+          Подпапка в /srv/music
+          <input
+            value={uploadDir}
+            onChange={(event) => onUploadDirChange(event.target.value)}
+            placeholder="Например: New arrivals/2026"
+          />
         </label>
-        <label className="secondary-button">
-          Выбрать и загрузить файлы
+        <label className="upload-zone">
+          <strong>Выбери файлы для загрузки</strong>
+          <span className="subtitle">MP3, FLAC, OGG, M4A и другие</span>
           <input
             type="file"
             accept=".mp3,.flac,.ogg,.opus,.m4a,.aac,.wav"
@@ -619,29 +788,36 @@ function SyncPage(props: {
       <article className="panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">Remote files</p>
-            <h2>Треки на Orange Pi</h2>
+            <p className="eyebrow">Прослушивание</p>
+            <h2>Треки на сервере</h2>
           </div>
         </div>
-        <div className="list">
-          {remoteTracks.map((track) => (
-            <div className="track-row" key={track.id}>
-              <div className="track-avatar">{(track.title[0] ?? '♪').toUpperCase()}</div>
-              <div className="track-copy">
-                <strong>{track.title}</strong>
-                <span>{track.relativePath}</span>
+        {!remoteTracks.length && !loadingRemote ? (
+          <div className="empty-state">
+            <div className="empty-icon">📂</div>
+            <p>На Orange Pi пока нет файлов или они не попали в поиск.</p>
+          </div>
+        ) : (
+          <div className="list">
+            {remoteTracks.map((track) => (
+              <div className="track-row-with-actions" key={track.id}>
+                <TrackRow
+                  track={track}
+                  sortMode={sortMode}
+                  active={track.id === currentId}
+                  favorite={favorites.has(track.id)}
+                  onPlay={() => onPlay(track, remoteTracks)}
+                  onToggleFavorite={() => onToggleFavorite(track.id)}
+                />
+                <div className="actions">
+                  <a className="secondary-button" href={track.remoteUrl} download>
+                    ⬇
+                  </a>
+                </div>
               </div>
-              <div className="actions">
-                <button type="button" onClick={() => onPlay(track)}>
-                  Играть
-                </button>
-                <a href={track.remoteUrl} download>
-                  Скачать
-                </a>
-              </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
       </article>
     </section>
   )
@@ -650,13 +826,16 @@ function SyncPage(props: {
 function SettingsPage(props: {
   serverUrl: string
   githubRepo: string
+  latestRelease: ReleaseInfo | null
   onServerUrlChange: (value: string) => void
   onGithubRepoChange: (value: string) => void
   onRefresh: () => Promise<void>
   onRefreshRelease: () => Promise<void>
 }) {
-  const { serverUrl, githubRepo, onServerUrlChange, onGithubRepoChange, onRefresh, onRefreshRelease } = props
-  const hasDirectoryPicker = typeof (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function'
+  const { serverUrl, githubRepo, latestRelease, onServerUrlChange, onGithubRepoChange, onRefresh, onRefreshRelease } =
+    props
+  const hasDirectoryPicker =
+    typeof (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function'
 
   return (
     <section className="page-grid">
@@ -664,43 +843,122 @@ function SettingsPage(props: {
         <div className="section-heading">
           <div>
             <p className="eyebrow">Подключение</p>
-            <h2>Адрес Orange Pi API</h2>
+            <h2>Orange Pi и обновления</h2>
           </div>
         </div>
         <label className="field">
-          Базовый URL
+          Базовый URL сервера
           <input value={serverUrl} onChange={(event) => onServerUrlChange(event.target.value)} />
         </label>
         <label className="field">
-          GitHub repo
-          <input value={githubRepo} onChange={(event) => onGithubRepoChange(event.target.value)} placeholder="owner/repo" />
+          GitHub repo (для APK)
+          <input
+            value={githubRepo}
+            onChange={(event) => onGithubRepoChange(event.target.value)}
+            placeholder="owner/repo"
+          />
         </label>
         <div className="actions">
-          <button type="button" onClick={() => void onRefresh()}>
-            Проверить и обновить
+          <button type="button" className="btn btn-primary" onClick={() => void onRefresh()}>
+            Проверить сервер
           </button>
-          <button type="button" onClick={() => void onRefreshRelease()}>
-            Проверить APK release
+          <button type="button" className="btn" onClick={() => void onRefreshRelease()}>
+            Проверить APK
           </button>
         </div>
-        <p>Формат тега релиза: <code>v1.2.0+12</code>, где <code>12</code> это Android versionCode.</p>
+        {latestRelease?.versionName ? (
+          <p style={{ marginTop: 12 }}>
+            Последний APK: {latestRelease.versionName} ({latestRelease.versionCode ?? '?'})
+          </p>
+        ) : null}
       </article>
 
       <article className="panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">Совместимость</p>
-            <h2>Что умеет текущий браузер</h2>
+            <p className="eyebrow">Браузер</p>
+            <h2>Возможности</h2>
           </div>
         </div>
         <div className="caps">
-          <StatCard label="Выбор папки" value={hasDirectoryPicker ? 'Да' : 'Fallback'} />
-          <StatCard label="PWA" value={'Да'} />
-          <StatCard label="Upload" value={'Да'} />
+          <StatCard label="Выбор папки" value={hasDirectoryPicker ? 'Да' : 'Импорт'} />
+          <StatCard label="PWA" value="Да" />
+          <StatCard label="Upload" value="Да" />
         </div>
       </article>
     </section>
   )
+}
+
+function SortSelect(props: { value: SortMode; onChange: (mode: SortMode) => void }) {
+  const { value, onChange } = props
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const current = SORT_MODES.find((mode) => mode.id === value) ?? SORT_MODES[0]
+
+  useEffect(() => {
+    if (!open) return
+    const close = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener('click', close)
+    return () => document.removeEventListener('click', close)
+  }, [open])
+
+  return (
+    <div className="sort-control" ref={rootRef}>
+      <span>Сортировка</span>
+      <button
+        type="button"
+        className="sort-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>{current.label}</span>
+        <span className="sort-chevron">{open ? '▴' : '▾'}</span>
+      </button>
+      {open ? (
+        <div className="sort-menu" role="listbox">
+          {SORT_MODES.map((mode) => (
+            <button
+              key={mode.id}
+              type="button"
+              role="option"
+              aria-selected={mode.id === value}
+              className={`sort-option${mode.id === value ? ' active' : ''}`}
+              onClick={() => {
+                onChange(mode.id)
+                setOpen(false)
+              }}
+            >
+              {mode.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function TrackArt(props: { track: MusicTrack; className?: string; fallback?: string }) {
+  const { track, className, fallback } = props
+  const [failed, setFailed] = useState(false)
+  const label = (fallback ?? track.title[0] ?? '♪').toUpperCase()
+
+  if (track.artUrl && !failed) {
+    return (
+      <img
+        src={track.artUrl}
+        alt=""
+        className={className}
+        loading="lazy"
+        onError={() => setFailed(true)}
+      />
+    )
+  }
+
+  return <span className={className}>{label}</span>
 }
 
 function TrackCard(props: {
@@ -713,7 +971,9 @@ function TrackCard(props: {
   const { track, active, favorite, onPlay, onToggleFavorite } = props
   return (
     <button type="button" className={`track-card ${active ? 'active' : ''}`} onClick={onPlay}>
-      <div className="artwork">{track.artUrl ? <img src={track.artUrl} alt="" /> : <span>{(track.title[0] ?? '♪').toUpperCase()}</span>}</div>
+      <div className="artwork">
+        <TrackArt track={track} className="artwork-image" />
+      </div>
       <div className="track-copy">
         <strong>{track.title}</strong>
         <span>{track.artist || 'Неизвестный исполнитель'}</span>
@@ -736,23 +996,33 @@ function TrackCard(props: {
 
 function TrackRow(props: {
   track: MusicTrack
+  sortMode: SortMode
   active: boolean
   favorite: boolean
   onPlay: () => void
   onToggleFavorite: () => void
 }) {
-  const { track, active, favorite, onPlay, onToggleFavorite } = props
+  const { track, sortMode, active, favorite, onPlay, onToggleFavorite } = props
+  const trailingMeta =
+    sortMode === 'date_added'
+      ? formatRelativeAddedAt(track.addedAt)
+      : sortMode === 'duration'
+        ? formatDuration(track.durationMs)
+        : formatDuration(track.durationMs)
+
   return (
     <div className={`track-row ${active ? 'active' : ''}`}>
       <button type="button" className="track-row-main" onClick={onPlay}>
-        <div className="track-avatar">{(track.title[0] ?? '♪').toUpperCase()}</div>
+        <div className="track-avatar">
+          <TrackArt track={track} className="track-avatar-image" />
+        </div>
         <div className="track-copy">
           <strong>{track.title}</strong>
           <span>
             {track.artist || 'Неизвестный исполнитель'} • {track.album || 'Неизвестный альбом'}
           </span>
         </div>
-        <span>{formatDuration(track.durationMs)}</span>
+        <span className="track-meta">{trailingMeta}</span>
       </button>
       <button type="button" className={`favorite plain ${favorite ? 'is-favorite' : ''}`} onClick={onToggleFavorite}>
         {favorite ? '♥' : '♡'}
@@ -770,6 +1040,38 @@ function StatCard(props: { label: string; value: string }) {
   )
 }
 
+function pageTitle(pathname: string): { title: string; subtitle: string } {
+  switch (pathname) {
+    case '/sync':
+      return {
+        title: 'Синхронизация',
+        subtitle: 'Библиотека Orange Pi, проигрывание и загрузка файлов с ПК.',
+      }
+    case '/settings':
+      return {
+        title: 'Настройки',
+        subtitle: 'Адрес сервера, GitHub repo и проверка APK-обновлений.',
+      }
+    default:
+      return {
+        title: 'Главная',
+        subtitle: 'Музыка с Orange Pi, рекомендации и избранное.',
+      }
+  }
+}
+
+function filterTracks(tracks: MusicTrack[], query: string) {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return tracks
+  return tracks.filter(
+    (track) =>
+      track.title.toLowerCase().includes(needle) ||
+      track.artist.toLowerCase().includes(needle) ||
+      track.album.toLowerCase().includes(needle) ||
+      track.relativePath.toLowerCase().includes(needle),
+  )
+}
+
 function formatDuration(durationMs: number) {
   if (!Number.isFinite(durationMs) || durationMs <= 0) return '0:00'
   const totalSeconds = Math.floor(durationMs / 1000)
@@ -778,80 +1080,25 @@ function formatDuration(durationMs: number) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`
 }
 
-function dedupeTracks(tracks: MusicTrack[]) {
-  const seen = new Set<string>()
-  return tracks.filter((track) => {
-    if (seen.has(track.id)) return false
-    seen.add(track.id)
-    return true
-  })
-}
-
-function createRemoteTrack(path: string, size: number, baseUrl: string): MusicTrack {
-  const title = path.split('/').pop()?.replace(/\.[^.]+$/, '') ?? path
+function createRemoteTrack(path: string, size: number, mtime: number, baseUrl: string): MusicTrack {
+  const parts = path.split('/')
+  const fileName = parts.pop() ?? path
+  const title = fileName.replace(/\.[^.]+$/, '')
+  const album = parts.length > 1 ? parts[parts.length - 1] : ''
+  const artist = parts.length > 0 ? parts[0] : ''
+  const base = baseUrl.replace(/\/$/, '')
+  const encodedPath = path.split('/').map(encodeURIComponent).join('/')
   return {
     id: `remote:${path}`,
     title,
-    artist: '',
-    album: '',
+    artist,
+    album,
     durationMs: 0,
     size,
+    addedAt: mtime,
     relativePath: path,
     source: 'remote',
-    remoteUrl: `${baseUrl.replace(/\/$/, '')}/files/${path.split('/').map(encodeURIComponent).join('/')}`,
+    remoteUrl: `${base}/files/${encodedPath}`,
+    artUrl: `${base}/api/art/${encodedPath}`,
   }
-}
-
-async function scanDirectory(
-  handle: FileSystemDirectoryHandle,
-  prefix = '',
-): Promise<MusicTrack[]> {
-  const tracks: MusicTrack[] = []
-  for await (const entry of handle.values()) {
-    const nextPath = prefix ? `${prefix}/${entry.name}` : entry.name
-    if (entry.kind === 'directory') {
-      tracks.push(...(await scanDirectory(entry, nextPath)))
-      continue
-    }
-    if (!isAudioFile(entry.name)) continue
-    const file = await entry.getFile()
-    tracks.push(await createTrackFromFile(file, nextPath))
-  }
-  return tracks
-}
-
-async function createTrackFromFile(file: File, relativePath: string): Promise<MusicTrack> {
-  const metadata = await parseBlob(file).catch(() => null)
-  const picture = metadata?.common.picture?.[0]
-  const artBytes = picture
-    ? (() => {
-        const bytes = new Uint8Array(picture.data.byteLength)
-        bytes.set(picture.data)
-        return bytes
-      })()
-    : undefined
-  const artUrl = picture
-    ? URL.createObjectURL(
-        new Blob([artBytes!], {
-          type: picture.format,
-        }),
-      )
-    : undefined
-  return {
-    id: `local:${relativePath}:${file.lastModified}:${file.size}`,
-    title: metadata?.common.title || file.name.replace(/\.[^.]+$/, ''),
-    artist: metadata?.common.artist || '',
-    album: metadata?.common.album || '',
-    durationMs: Math.round((metadata?.format.duration ?? 0) * 1000),
-    size: file.size,
-    relativePath,
-    source: 'local',
-    artUrl,
-    objectUrl: URL.createObjectURL(file),
-    file,
-  }
-}
-
-function isAudioFile(name: string) {
-  return /\.(mp3|flac|ogg|opus|m4a|aac|wav)$/i.test(name)
 }

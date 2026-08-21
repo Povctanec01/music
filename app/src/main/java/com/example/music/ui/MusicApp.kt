@@ -1,6 +1,8 @@
 package com.example.music.ui
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -8,12 +10,15 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
@@ -28,6 +33,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -56,6 +62,7 @@ private object Routes {
 fun MusicApp() {
     val context = LocalContext.current
     val container = (context.applicationContext as MusicApplication).container
+    val preferences = container.preferences
     val playback = container.playbackController
     val updates = container.appUpdateManager
     val playerState by playback.state.collectAsStateWithLifecycle()
@@ -81,11 +88,26 @@ fun MusicApp() {
         dismissedTag = null
     }
 
-    androidx.compose.runtime.DisposableEffect(lifecycleOwner, updates) {
+    fun restartApp() {
+        val pm = context.packageManager
+        val launch = pm.getLaunchIntentForPackage(context.packageName)
+        launch?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        if (launch != null) context.startActivity(launch)
+        (context as? Activity)?.finish()
+    }
+
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner, updates, preferences) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                if (!updates.state.value.checking) {
-                    scope.launch { updates.checkForUpdates() }
+                scope.launch {
+                    if (preferences.pendingUpdateRestartOnce()) {
+                        preferences.clearPendingUpdateRestart()
+                        restartApp()
+                        return@launch
+                    }
+                    if (!updates.state.value.checking) {
+                        updates.checkForUpdates()
+                    }
                 }
             }
         }
@@ -155,19 +177,46 @@ fun MusicApp() {
             onDismissRequest = { dismissedTag = release.tagName },
             title = { Text("Доступно обновление") },
             text = {
-                Text(
-                    "Найдена версия ${release.versionName ?: release.tagName}. " +
-                        "Можно скачать APK и открыть системный установщик прямо сейчас.",
-                )
+                Column(Modifier.fillMaxWidth()) {
+                    Text(
+                        "Найдена версия ${release.versionName ?: release.tagName}. " +
+                            "Можно скачать APK и открыть системный установщик прямо сейчас.",
+                    )
+
+                    if (updateState.downloading) {
+                        Spacer(Modifier.padding(top = 12.dp))
+                        val p = updateState.downloadProgress
+                        if (p != null) {
+                            LinearProgressIndicator(
+                                progress = { p.coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        } else {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                    }
+
+                    if (updateState.installing) {
+                        Spacer(Modifier.padding(top = 12.dp))
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                }
             },
             confirmButton = {
                 TextButton(
+                    enabled = !updateState.downloading && !updateState.installing,
                     onClick = {
                         dismissedTag = release.tagName
                         scope.launch { updates.downloadAndInstall() }
                     },
                 ) {
-                    Text("Скачать и установить")
+                    Text(
+                        when {
+                            updateState.downloading -> "Скачивание…"
+                            updateState.installing -> "Установщик…"
+                            else -> "Скачать и установить"
+                        },
+                    )
                 }
             },
             dismissButton = {

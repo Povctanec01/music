@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.music.MusicApplication
 import com.example.music.data.update.AppUpdateState
 import com.example.music.domain.model.DownloadNetworkMode
+import com.example.music.domain.model.GroupMode
 import com.example.music.ui.sync.label
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -21,6 +22,7 @@ data class SettingsUiState(
     val tailscaleUrl: String = "",
     val githubRepo: String = "",
     val networkMode: DownloadNetworkMode = DownloadNetworkMode.WIFI_ONLY,
+    val groupModeOrder: List<GroupMode> = GroupMode.entries.toList(),
     val checking: Boolean = false,
     val checkResult: String? = null,
 )
@@ -31,6 +33,7 @@ private data class SettingsCore(
     val tailscaleUrl: String,
     val githubRepo: String,
     val networkMode: DownloadNetworkMode,
+    val groupModeOrder: List<GroupMode>,
 )
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
@@ -43,24 +46,43 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val checking = MutableStateFlow(false)
     private val checkResult = MutableStateFlow<String?>(null)
 
-    val uiState: StateFlow<SettingsUiState> = combine(
+    private val coreBase: StateFlow<SettingsCore> =
         combine(
             preferences.folderUri,
             preferences.lanUrl,
             preferences.tailscaleUrl,
             preferences.githubRepo,
             preferences.downloadNetworkMode,
-            ::SettingsCore,
-        ),
-        checking,
-        checkResult,
-    ) { core, isChecking, result ->
+        ) { folderUri, lanUrl, tailscaleUrl, githubRepo, networkMode ->
+            SettingsCore(
+                folderUri = folderUri,
+                lanUrl = lanUrl,
+                tailscaleUrl = tailscaleUrl,
+                githubRepo = githubRepo,
+                networkMode = networkMode,
+                groupModeOrder = GroupMode.entries.toList(), // replaced below
+            )
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SettingsCore(
+            folderUri = null,
+            lanUrl = "",
+            tailscaleUrl = "",
+            githubRepo = "",
+            networkMode = DownloadNetworkMode.WIFI_ONLY,
+            groupModeOrder = GroupMode.entries.toList(),
+        ))
+
+    private val coreWithOrder = combine(coreBase, preferences.groupModeOrder) { core, order ->
+        core.copy(groupModeOrder = order)
+    }
+
+    val uiState: StateFlow<SettingsUiState> = combine(coreWithOrder, checking, checkResult) { core, isChecking, result ->
         SettingsUiState(
             folderUri = core.folderUri,
             lanUrl = core.lanUrl,
             tailscaleUrl = core.tailscaleUrl,
             githubRepo = core.githubRepo,
             networkMode = core.networkMode,
+            groupModeOrder = core.groupModeOrder,
             checking = isChecking,
             checkResult = result,
         )
@@ -111,5 +133,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun downloadAndInstallUpdate() {
         viewModelScope.launch { container.appUpdateManager.downloadAndInstall() }
+    }
+
+    fun setGroupModeOrder(order: List<GroupMode>) {
+        viewModelScope.launch { preferences.setGroupModeOrder(order) }
     }
 }
