@@ -84,14 +84,19 @@ class TrackArtRepository(
 
     fun notifySidecarFromDisk(relativePath: String, version: Long = 0L, contentUri: Uri? = null) {
         val cacheKey = TrackArtCache.key(relativePath)
-        if (mutableFlows[cacheKey]?.value is ArtLoadState.Ready) return
+        if (mutableFlows[cacheKey]?.value is ArtLoadState.Ready) {
+            ArtLog.d("art.notifyDisk.skipReady", relativePath)
+            return
+        }
+        ArtLog.d("art.notifyDisk", relativePath)
         observeFor(relativePath, version, contentUri)
         val flow = mutableFlows[cacheKey] ?: return
         scope.launch {
             if (flow.value is ArtLoadState.Ready) return@launch
             sidecarArtSync.loadSidecarBitmap(relativePath, contentUri)?.let { bitmap ->
                 persistAndPublish(cacheKey, flow, bitmap)
-            }
+                ArtLog.d("art.notifyDisk.hit", relativePath)
+            } ?: ArtLog.w("art.notifyDisk.miss", relativePath)
         }
     }
 
@@ -226,6 +231,7 @@ class TrackArtRepository(
         if (!force && active?.isActive == true) return
         if (force) active?.cancel()
 
+        ArtLog.d("art.scheduleLoad", "path=${request.relativePath} force=$force state=${flow.value::class.simpleName}")
         inFlight[request.cacheKey] = scope.launch {
             try {
                 loadArt(request, flow)
@@ -237,6 +243,8 @@ class TrackArtRepository(
 
     private suspend fun loadArt(request: ArtRequest, flow: MutableStateFlow<ArtLoadState>) {
         if (flow.value is ArtLoadState.Ready) return
+        val start = System.currentTimeMillis()
+        ArtLog.d("art.load.start", request.relativePath)
         downloadSemaphore.withPermit {
             val finished = withTimeoutOrNull(45_000L) {
                 try {
@@ -283,14 +291,17 @@ class TrackArtRepository(
                     }
 
                     flow.value = ArtLoadState.Missing
+                    ArtLog.w("art.load.missing", "${request.relativePath} ${System.currentTimeMillis() - start}ms")
                     true
-                } catch (_: Exception) {
+                } catch (e: Exception) {
                     flow.value = ArtLoadState.Missing
+                    ArtLog.e("art.load.error", request.relativePath, e)
                     true
                 }
             }
             if (finished == null) {
                 flow.value = ArtLoadState.Missing
+                ArtLog.w("art.load.timeout", "${request.relativePath} ${System.currentTimeMillis() - start}ms")
             }
         }
     }
@@ -321,5 +332,6 @@ class TrackArtRepository(
     private fun publishReady(cacheKey: String, flow: MutableStateFlow<ArtLoadState>, bitmap: Bitmap) {
         TrackArtCache.put(cacheKey, bitmap)
         flow.value = ArtLoadState.Ready(bitmap)
+        ArtLog.d("art.ready", cacheKey)
     }
 }

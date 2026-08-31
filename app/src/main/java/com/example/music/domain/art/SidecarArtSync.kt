@@ -6,6 +6,7 @@ import android.net.Uri
 import com.example.music.data.local.SafStorage
 import com.example.music.data.preferences.AppPreferences
 import com.example.music.data.remote.ServerClient
+import com.example.music.domain.art.ArtLog
 import com.example.music.domain.model.Track
 
 /** Downloads cover art from the server and stores `{stem}.jpg` next to audio in SAF folder. */
@@ -19,10 +20,21 @@ class SidecarArtSync(
 
     suspend fun loadSidecarBitmap(audioRelativePath: String, audioUri: Uri? = null): Bitmap? {
         audioUri?.let { uri ->
-            storage.readSidecarNextToAudio(uri)?.let { return it }
+            storage.readSidecarNextToAudio(uri)?.let {
+                ArtLog.d("sidecar.read.nextToAudio", "hit path=$audioRelativePath")
+                return it
+            }
         }
-        val treeUri = preferences.folderUriOnce()?.let(Uri::parse) ?: return null
-        return storage.readSidecarBitmap(treeUri, audioRelativePath)
+        val treeUri = preferences.folderUriOnce()?.let(Uri::parse) ?: run {
+            ArtLog.w("sidecar.read.noFolder", audioRelativePath)
+            return null
+        }
+        return storage.readSidecarBitmap(treeUri, audioRelativePath)?.also {
+            ArtLog.d("sidecar.read.tree", "hit path=$audioRelativePath")
+        } ?: run {
+            ArtLog.d("sidecar.read.miss", audioRelativePath)
+            null
+        }
     }
 
     suspend fun downloadAndSave(
@@ -36,15 +48,21 @@ class SidecarArtSync(
         force: Boolean = false,
     ): ByteArray? {
         if (!force) {
-            loadSidecarBitmap(audioRelativePath, audioUri)?.let { return ByteArray(0) }
+            loadSidecarBitmap(audioRelativePath, audioUri)?.let {
+                ArtLog.d("sidecar.download.skip", "already on disk path=$audioRelativePath")
+                return ByteArray(0)
+            }
         }
 
         val sidecarPath = TrackSidecarArt.primarySidecarRelativePath(audioRelativePath)
         for (path in listOf(sidecarPath, sidecarPath.substringAfterLast('/')).distinct()) {
+            ArtLog.d("sidecar.download.files", "try path=$path")
             server.downloadFileBytes(serverBaseUrl, path)?.let { bytes ->
+                ArtLog.d("sidecar.download.files.hit", "path=$path bytes=${bytes.size}")
                 persistSidecar(bytes, treeUri, audioRelativePath, audioUri)
                 return bytes
             }
+            ArtLog.d("sidecar.download.files.miss", path)
         }
 
         val resolved = serverIndex.resolve(audioRelativePath, *extraPaths)
@@ -55,12 +73,16 @@ class SidecarArtSync(
         }.distinctBy { it.first }
 
         for ((path, version) in artCandidates) {
+            ArtLog.d("sidecar.download.apiArt", "try path=$path v=$version")
             server.downloadArtBytes(serverBaseUrl, path, version)?.let { bytes ->
+                ArtLog.d("sidecar.download.apiArt.hit", "path=$path bytes=${bytes.size}")
                 persistSidecar(bytes, treeUri, audioRelativePath, audioUri)
                 return bytes
             }
+            ArtLog.d("sidecar.download.apiArt.miss", path)
         }
 
+        ArtLog.w("sidecar.download.fail", audioRelativePath)
         return null
     }
 
@@ -106,10 +128,12 @@ class SidecarArtSync(
         audioRelativePath: String,
         audioUri: Uri?,
     ) {
-        if (bytes.size <= 128) return
-        if (audioUri != null) {
-            storage.writeSidecarNextToAudio(audioUri, bytes)
+        if (bytes.size <= 128) {
+            ArtLog.w("sidecar.persist.skipSmall", "path=$audioRelativePath bytes=${bytes.size}")
+            return
         }
-        storage.writeSidecarImage(treeUri, audioRelativePath, bytes)
+        val nextOk = audioUri != null && storage.writeSidecarNextToAudio(audioUri, bytes)
+        val treeOk = storage.writeSidecarImage(treeUri, audioRelativePath, bytes)
+        ArtLog.d("sidecar.persist", "path=$audioRelativePath nextToAudio=$nextOk tree=$treeOk bytes=${bytes.size}")
     }
 }

@@ -7,6 +7,7 @@ import com.example.music.data.local.SafStorage
 import com.example.music.data.preferences.AppPreferences
 import com.example.music.data.remote.NetworkMonitor
 import com.example.music.data.remote.ServerClient
+import com.example.music.domain.art.ArtLog
 import com.example.music.domain.art.SidecarArtSync
 import com.example.music.domain.art.ServerArtIndex
 import com.example.music.domain.art.TrackArtRepository
@@ -117,8 +118,10 @@ class DownloadManager(
 
         startForegroundService()
         _running.value = true
+        ArtLog.clearUi()
         refreshArtContext(endpoint)
         _statusMessage.value = channelLabel(endpoint.channel)
+        ArtLog.d("download.queue.start", "tasks=${_tasks.value.size}")
 
         try {
             while (true) {
@@ -145,7 +148,9 @@ class DownloadManager(
                 }
 
                 try {
+                    ArtLog.d("download.audio.start", next.path)
                     downloadOne(folder, endpoint, next)
+                    ArtLog.d("download.audio.done", next.path)
                 } catch (_: PausedException) {
                     // already marked as paused
                 } catch (e: Exception) {
@@ -248,35 +253,65 @@ class DownloadManager(
     ) {
         val basename = task.path.substringAfterLast('/')
         val extraPaths = arrayOf(basename, basename.substringBeforeLast('.'))
-        if (!task.hasArt) {
-            runCatching { server.prefetchArtPaths(baseUrl, listOf(task.path), force = true) }
-        }
+        ArtLog.d(
+            "download.sidecar.start",
+            "path=${task.path} hasArt=${task.hasArt}",
+        )
+        _statusMessage.value = "Обложка: $basename…"
 
-        var bytes: ByteArray? = null
-        for (attempt in 0 until SIDECAR_RETRY_COUNT) {
-            if (attempt > 0) delay(SIDECAR_RETRY_DELAY_MS * attempt)
-            bytes = sidecarArtSync.downloadAndSave(
-                treeUri = folder,
-                serverBaseUrl = baseUrl,
-                audioRelativePath = task.path,
-                mtime = task.mtime,
-                audioUri = audioUri,
-                serverIndex = trackArtRepository.serverIndex,
-                extraPaths = extraPaths,
-                force = true,
-            )
-            if (bytes != null) break
-        }
+        withTimeoutOrNull(SIDECAR_TOTAL_TIMEOUT_MS) {
+            if (!task.hasArt) {
+                ArtLog.d("download.sidecar.prefetch", task.path)
+                _statusMessage.value = "Обложка: запрос на сервере для $basename…"
+                runCatching { server.prefetchArtPaths(baseUrl, listOf(task.path), force = true) }
+                    .onSuccess { result ->
+                        ArtLog.d(
+                            "download.sidecar.prefetch.result",
+                            "ready=${result?.ready} missing=${result?.missing} status=${result?.status}",
+                        )
+                    }
+                    .onFailure { ArtLog.w("download.sidecar.prefetch.fail", task.path, it) }
+            }
 
-        bytes?.takeIf { it.isNotEmpty() }?.let {
-            trackArtRepository.onSidecarSaved(
-                relativePath = task.path,
-                version = task.mtime,
-                contentUri = audioUri,
-                bytes = it,
-            )
-        }
-        trackArtRepository.notifySidecarFromDisk(task.path, task.mtime, audioUri)
+            var bytes: ByteArray? = null
+            for (attempt in 0 until SIDECAR_RETRY_COUNT) {
+                if (attempt > 0) {
+                    ArtLog.d("download.sidecar.retry", "path=${task.path} attempt=${attempt + 1}/$SIDECAR_RETRY_COUNT")
+                    delay(SIDECAR_RETRY_DELAY_MS * attempt)
+                }
+                _statusMessage.value = "Обложка: $basename (${attempt + 1}/$SIDECAR_RETRY_COUNT)…"
+                bytes = sidecarArtSync.downloadAndSave(
+                    treeUri = folder,
+                    serverBaseUrl = baseUrl,
+                    audioRelativePath = task.path,
+                    mtime = task.mtime,
+                    audioUri = audioUri,
+                    serverIndex = trackArtRepository.serverIndex,
+                    extraPaths = extraPaths,
+                    force = true,
+                )
+                if (bytes != null) {
+                    ArtLog.d(
+                        "download.sidecar.got",
+                        "path=${task.path} bytes=${bytes.size}",
+                    )
+                    break
+                }
+                ArtLog.w("download.sidecar.attempt.miss", "path=${task.path} attempt=${attempt + 1}")
+            }
+
+            bytes?.takeIf { it.isNotEmpty() }?.let {
+                trackArtRepository.onSidecarSaved(
+                    relativePath = task.path,
+                    version = task.mtime,
+                    contentUri = audioUri,
+                    bytes = it,
+                )
+            }
+            trackArtRepository.notifySidecarFromDisk(task.path, task.mtime, audioUri)
+        } ?: ArtLog.w("download.sidecar.timeout", "path=${task.path} after ${SIDECAR_TOTAL_TIMEOUT_MS}ms")
+
+        ArtLog.d("download.sidecar.end", task.path)
     }
 
     private suspend fun refreshArtContext(endpoint: ServerEndpoint) {
@@ -319,5 +354,6 @@ class DownloadManager(
         private const val DEFAULT_BUFFER = 64 * 1024
         private const val SIDECAR_RETRY_COUNT = 6
         private const val SIDECAR_RETRY_DELAY_MS = 1000L
+        private const val SIDECAR_TOTAL_TIMEOUT_MS = 45_000L
     }
 }

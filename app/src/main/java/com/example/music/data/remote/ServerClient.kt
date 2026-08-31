@@ -1,6 +1,7 @@
 package com.example.music.data.remote
 
 import com.example.music.data.update.AppReleaseInfo
+import com.example.music.domain.art.ArtLog
 import com.example.music.domain.model.ConnectionChannel
 import com.example.music.domain.model.RemoteFile
 import com.example.music.domain.model.RemoteLibrary
@@ -117,18 +118,22 @@ class ServerClient(private val json: Json) {
         force: Boolean = false,
     ): ArtPrefetchResult? = withContext(Dispatchers.IO) {
         if (paths.isEmpty()) return@withContext null
+        ArtLog.d("http.prefetchArtPaths", "paths=$paths force=$force")
         val body = json.encodeToString(ArtPrefetchRequest(paths, force))
             .toRequestBody("application/json".toMediaType())
         val request = Request.Builder()
             .url(normalize(baseUrl) + "/api/art/prefetch")
             .post(body)
             .build()
+        val start = System.currentTimeMillis()
         try {
             prefetchHttp.newCall(request).execute().use { response ->
+                ArtLog.d("http.prefetchArtPaths.response", "code=${response.code} ${System.currentTimeMillis() - start}ms")
                 if (!response.isSuccessful) return@withContext null
                 json.decodeFromString<ArtPrefetchResult>(response.body?.string().orEmpty())
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            ArtLog.w("http.prefetchArtPaths.fail", "${System.currentTimeMillis() - start}ms", e)
             null
         }
     }
@@ -180,20 +185,27 @@ class ServerClient(private val json: Json) {
 
     suspend fun downloadFileBytes(baseUrl: String, relativePath: String): ByteArray? =
         withContext(Dispatchers.IO) {
+            val start = System.currentTimeMillis()
             try {
                 downloadCall(baseUrl, relativePath, 0).execute().use { response ->
+                    ArtLog.d("http.files", "path=$relativePath code=${response.code} ${System.currentTimeMillis() - start}ms")
                     if (!response.isSuccessful) return@withContext null
                     val bytes = response.body?.bytes() ?: return@withContext null
-                    if (bytes.size <= 128) return@withContext null
+                    if (bytes.size <= 128) {
+                        ArtLog.w("http.files.tooSmall", "path=$relativePath bytes=${bytes.size}")
+                        return@withContext null
+                    }
                     bytes
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                ArtLog.w("http.files.fail", "path=$relativePath ${System.currentTimeMillis() - start}ms", e)
                 null
             }
         }
 
     suspend fun downloadArtBytes(baseUrl: String, relativePath: String, version: Long): ByteArray? =
         withContext(Dispatchers.IO) {
+            val start = System.currentTimeMillis()
             try {
                 val encoded = relativePath.split('/')
                     .joinToString("/") { part ->
@@ -204,12 +216,17 @@ class ServerClient(private val json: Json) {
                     .get()
                     .build()
                 downloadHttp.newCall(request).execute().use { response ->
+                    ArtLog.d("http.apiArt", "path=$relativePath code=${response.code} ${System.currentTimeMillis() - start}ms")
                     if (!response.isSuccessful) return@withContext null
                     val bytes = response.body?.bytes() ?: return@withContext null
-                    if (bytes.size <= 128) return@withContext null
+                    if (bytes.size <= 128) {
+                        ArtLog.w("http.apiArt.tooSmall", "path=$relativePath bytes=${bytes.size}")
+                        return@withContext null
+                    }
                     bytes
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                ArtLog.w("http.apiArt.fail", "path=$relativePath ${System.currentTimeMillis() - start}ms", e)
                 null
             }
         }

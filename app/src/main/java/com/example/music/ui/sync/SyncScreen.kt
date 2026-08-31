@@ -35,6 +35,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.music.domain.art.ArtLog
 import com.example.music.domain.formatBytes
 import com.example.music.domain.model.ConnectionChannel
 import com.example.music.domain.model.DownloadStatus
@@ -48,6 +49,7 @@ fun SyncScreen(viewModel: SyncViewModel = viewModel()) {
     val paused by viewModel.downloads.paused.collectAsStateWithLifecycle()
     val message by viewModel.downloads.statusMessage.collectAsStateWithLifecycle()
     val lastError by viewModel.downloads.lastError.collectAsStateWithLifecycle()
+    val artLogs by ArtLog.recentLines.collectAsStateWithLifecycle()
     val selectedCount = state.newFiles.count { it.path in state.selected }
     val failedTasks = tasks.filter { it.status == DownloadStatus.ERROR && !it.error.isNullOrBlank() }
 
@@ -110,6 +112,23 @@ fun SyncScreen(viewModel: SyncViewModel = viewModel()) {
             lastError?.let {
                 ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                     Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(16.dp))
+                }
+            }
+
+            if (running && artLogs.isNotEmpty()) {
+                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Лог обложек", style = MaterialTheme.typography.titleSmall)
+                        artLogs.takeLast(8).forEach { line ->
+                            Text(
+                                line,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
                 }
             }
 
