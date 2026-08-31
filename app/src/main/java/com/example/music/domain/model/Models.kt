@@ -38,6 +38,7 @@ data class RemoteFile(
     val path: String,
     val size: Long,
     val mtime: Long = 0L,
+    val hasArt: Boolean = false,
 )
 
 enum class DownloadStatus {
@@ -47,6 +48,8 @@ enum class DownloadStatus {
 data class DownloadTask(
     val path: String,
     val size: Long,
+    val mtime: Long = 0L,
+    val hasArt: Boolean = false,
     val bytesDownloaded: Long = 0L,
     val status: DownloadStatus = DownloadStatus.QUEUED,
     val error: String? = null,

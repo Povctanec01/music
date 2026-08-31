@@ -5,11 +5,17 @@ import com.example.music.domain.model.ConnectionChannel
 import com.example.music.domain.model.RemoteFile
 import com.example.music.domain.model.RemoteLibrary
 import com.example.music.domain.model.ServerEndpoint
+import com.example.music.domain.model.UploadResponse
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
@@ -25,6 +31,20 @@ class ServerClient(private val json: Json) {
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
+    private val prefetchHttp = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(8, TimeUnit.SECONDS)
+        .callTimeout(10, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
+    private val downloadHttp = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.MINUTES)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
@@ -65,6 +85,54 @@ class ServerClient(private val json: Json) {
         }
     }
 
+    suspend fun refreshAllArt(baseUrl: String): ArtRefreshResult = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(normalize(baseUrl) + "/api/art/refresh")
+            .get()
+            .build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                error("Сервер ответил ${response.code}")
+            }
+            json.decodeFromString<ArtRefreshResult>(response.body?.string().orEmpty())
+        }
+    }
+
+    suspend fun prefetchArt(baseUrl: String): ArtPrefetchResult = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(normalize(baseUrl) + "/api/art/prefetch")
+            .get()
+            .build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                error("Сервер ответил ${response.code}")
+            }
+            json.decodeFromString<ArtPrefetchResult>(response.body?.string().orEmpty())
+        }
+    }
+
+    suspend fun prefetchArtPaths(
+        baseUrl: String,
+        paths: List<String>,
+        force: Boolean = false,
+    ): ArtPrefetchResult? = withContext(Dispatchers.IO) {
+        if (paths.isEmpty()) return@withContext null
+        val body = json.encodeToString(ArtPrefetchRequest(paths, force))
+            .toRequestBody("application/json".toMediaType())
+        val request = Request.Builder()
+            .url(normalize(baseUrl) + "/api/art/prefetch")
+            .post(body)
+            .build()
+        try {
+            prefetchHttp.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return@withContext null
+                json.decodeFromString<ArtPrefetchResult>(response.body?.string().orEmpty())
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     suspend fun latestRelease(baseUrl: String, repo: String): AppReleaseInfo = withContext(Dispatchers.IO) {
         val encodedRepo = URLEncoder.encode(repo.trim(), StandardCharsets.UTF_8.name())
         val request = Request.Builder()
@@ -79,8 +147,72 @@ class ServerClient(private val json: Json) {
         }
     }
 
+    suspend fun upload(
+        baseUrl: String,
+        relativeDir: String,
+        fileName: String,
+        bytes: ByteArray,
+        mimeType: String,
+    ): UploadResponse = withContext(Dispatchers.IO) {
+        val encodedPath = URLEncoder.encode(relativeDir.trim(), StandardCharsets.UTF_8.name())
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart(
+                "files",
+                fileName,
+                bytes.toRequestBody(mimeType.toMediaType()),
+            )
+            .build()
+        val request = Request.Builder()
+            .url(normalize(baseUrl) + "/api/upload?path=$encodedPath")
+            .post(body)
+            .build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                error("Ошибка загрузки: ${response.code}")
+            }
+            json.decodeFromString<UploadResponse>(response.body?.string().orEmpty())
+        }
+    }
+
     fun downloadCall(baseUrl: String, relativePath: String, offset: Long) =
-        http.newCall(downloadRequest(baseUrl, relativePath, offset))
+        downloadHttp.newCall(downloadRequest(baseUrl, relativePath, offset))
+
+    suspend fun downloadFileBytes(baseUrl: String, relativePath: String): ByteArray? =
+        withContext(Dispatchers.IO) {
+            try {
+                downloadCall(baseUrl, relativePath, 0).execute().use { response ->
+                    if (!response.isSuccessful) return@withContext null
+                    val bytes = response.body?.bytes() ?: return@withContext null
+                    if (bytes.size <= 128) return@withContext null
+                    bytes
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    suspend fun downloadArtBytes(baseUrl: String, relativePath: String, version: Long): ByteArray? =
+        withContext(Dispatchers.IO) {
+            try {
+                val encoded = relativePath.split('/')
+                    .joinToString("/") { part ->
+                        URLEncoder.encode(part, StandardCharsets.UTF_8.name()).replace("+", "%20")
+                    }
+                val request = Request.Builder()
+                    .url("${normalize(baseUrl)}/api/art/$encoded?v=$version")
+                    .get()
+                    .build()
+                downloadHttp.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@withContext null
+                    val bytes = response.body?.bytes() ?: return@withContext null
+                    if (bytes.size <= 128) return@withContext null
+                    bytes
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
 
     private fun downloadRequest(baseUrl: String, relativePath: String, offset: Long): Request {
         val encoded = relativePath.split('/')
@@ -96,3 +228,25 @@ class ServerClient(private val json: Json) {
 
     private fun normalize(url: String): String = url.trim().trimEnd('/')
 }
+
+@Serializable
+data class ArtRefreshResult(
+    val total: Int = 0,
+    val refreshed: Int = 0,
+    val missing: Int = 0,
+)
+
+@Serializable
+data class ArtPrefetchRequest(
+    val paths: List<String>,
+    val force: Boolean = false,
+)
+
+@Serializable
+data class ArtPrefetchResult(
+    val total: Int = 0,
+    val ready: Int = 0,
+    val missing: Int = 0,
+    val pending: Int = 0,
+    val status: String = "",
+)

@@ -44,6 +44,13 @@ class MusicDownloadService : Service() {
                         indeterminate = false,
                         text = running.path.substringAfterLast('/'),
                     )
+                } else if (done > 0 && done >= total) {
+                    buildNotification(
+                        title = "Скачано $done из $total",
+                        progress = total,
+                        max = total.coerceAtLeast(1),
+                        indeterminate = false,
+                    )
                 } else {
                     buildNotification("Загрузка музыки", done, total.coerceAtLeast(1), total == 0)
                 }

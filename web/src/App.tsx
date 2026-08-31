@@ -2,21 +2,28 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import './App.css'
 import { favoriteTracks, groupTracks, LIBRARY_TABS, SORT_MODES, sortTracks, type LibraryTab, type SortMode, formatRelativeAddedAt, groupNewestAddedAt } from './library'
-import { buildRecommendationSections, emptyBehavior } from './recommendations'
+import { createLoudnessController, type LoudnessController } from './loudness'
+import { loadLoudnessNormalize, saveLoudnessNormalize } from './loudnessStorage'
+import { buildRecommendationSections, emptyBehavior, pickWeightedShuffle } from './recommendations'
 import {
   loadBehavior,
   loadFavorites,
   loadGithubRepo,
   loadLibraryTab,
   loadServerUrl,
+  loadShuffle,
   loadSortMode,
+  loadVolume,
   saveBehavior,
   saveFavorites,
   saveGithubRepo,
   saveLibraryTab,
   saveServerUrl,
+  saveShuffle,
   saveSortMode,
+  saveVolume,
 } from './storage'
+import { TrimPage } from './TrimPage'
 import type { ListeningBehavior, MusicTrack, RecommendationSection, ReleaseInfo } from './types'
 
 function App() {
@@ -44,8 +51,15 @@ function App() {
     const saved = loadSortMode()
     return SORT_MODES.some((mode) => mode.id === saved) ? (saved as SortMode) : 'date_added'
   })
+  const [volume, setVolume] = useState(loadVolume)
+  const [loudnessNormalize, setLoudnessNormalize] = useState(loadLoudnessNormalize)
+  const [shuffle, setShuffle] = useState(loadShuffle)
+  const [serverOnline, setServerOnline] = useState<boolean | null>(null)
   const [expandedGroup, setExpandedGroup] = useState<string | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const loudnessRef = useRef<LoudnessController | null>(null)
+  const playerBarRef = useRef<HTMLElement | null>(null)
+  const recentShuffleIdsRef = useRef<string[]>([])
   const location = useLocation()
   const lastTrackedPosition = useRef(0)
   const pendingListenedMs = useRef(0)
@@ -85,6 +99,53 @@ function App() {
   }, [sortMode])
 
   useEffect(() => {
+    saveVolume(volume)
+    loudnessRef.current?.setMasterVolume(volume)
+    const audio = audioRef.current
+    if (audio && !loudnessRef.current) audio.volume = volume
+  }, [volume])
+
+  useEffect(() => {
+    saveShuffle(shuffle)
+  }, [shuffle])
+
+  useEffect(() => {
+    saveLoudnessNormalize(loudnessNormalize)
+    loudnessRef.current?.setEnabled(loudnessNormalize)
+  }, [loudnessNormalize])
+
+  useEffect(() => {
+    const audio = audioRef.current
+    if (!audio || loudnessRef.current) return
+    loudnessRef.current = createLoudnessController(audio)
+    loudnessRef.current.setEnabled(loudnessNormalize)
+    loudnessRef.current.setMasterVolume(volume)
+    return () => {
+      loudnessRef.current?.dispose()
+      loudnessRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    const el = playerBarRef.current
+    if (!currentTrack || !el) {
+      document.documentElement.style.removeProperty('--player-bar-height')
+      return
+    }
+    const apply = () => {
+      document.documentElement.style.setProperty('--player-bar-height', `${el.offsetHeight}px`)
+    }
+    apply()
+    const observer = new ResizeObserver(apply)
+    observer.observe(el)
+    return () => {
+      observer.disconnect()
+      document.documentElement.style.removeProperty('--player-bar-height')
+    }
+  }, [currentTrack])
+
+  useEffect(() => {
     void refreshRemoteLibrary()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverUrl])
@@ -104,6 +165,8 @@ function App() {
     const source = currentTrack.objectUrl ?? currentTrack.remoteUrl
     if (!source) return
     audio.src = source
+    audio.volume = loudnessRef.current ? 1 : volume
+    loudnessRef.current?.resetForTrack()
     void audio.play()
     setIsPlaying(true)
     setPositionMs(0)
@@ -163,7 +226,13 @@ function App() {
       audio.removeEventListener('timeupdate', onTimeUpdate)
       audio.removeEventListener('ended', onEnded)
     }
-  }, [currentTrack, durationMs])
+  }, [currentTrack, durationMs, shuffle, queue, currentIndex, remoteTracks, behavior, favorites])
+
+  useEffect(() => {
+    if (shuffle && remoteTracks.length > 1) {
+      setQueue((current) => (remoteTracks.length > current.length ? remoteTracks : current))
+    }
+  }, [shuffle, remoteTracks])
 
   async function refreshRemoteLibrary() {
     setLoadingRemote(true)
@@ -200,6 +269,31 @@ function App() {
     await refreshRemoteLibrary()
   }
 
+  async function deleteRemoteTrack(track: MusicTrack) {
+    const confirmed = window.confirm(`Удалить «${track.title}» с Orange Pi?`)
+    if (!confirmed) return
+    setStatus(`Удаляю ${track.title}…`)
+    try {
+      const base = serverUrl.replace(/\/$/, '')
+      const encodedPath = track.relativePath.split('/').map(encodeURIComponent).join('/')
+      const response = await fetch(`${base}/api/file/${encodedPath}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(`Удаление: ${response.status}`)
+      if (currentId === track.id) {
+        setCurrentId(null)
+        setIsPlaying(false)
+        const audio = audioRef.current
+        if (audio) {
+          audio.pause()
+          audio.removeAttribute('src')
+        }
+      }
+      setStatus(`Удалено: ${track.title}`)
+      await refreshRemoteLibrary()
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Не удалось удалить файл')
+    }
+  }
+
   async function fetchLatestRelease() {
     const repo = githubRepo.trim()
     if (!repo) {
@@ -222,8 +316,17 @@ function App() {
   }
 
   function playSelection(track: MusicTrack, tracks: MusicTrack[]) {
-    setQueue(tracks)
+    const pool = shuffle && remoteTracks.length > tracks.length ? remoteTracks : tracks
+    setQueue(pool)
+    rememberShuffleId(track.id)
     setCurrentId(track.id)
+  }
+
+  function rememberShuffleId(trackId: string) {
+    const recent = recentShuffleIdsRef.current
+    if (recent[recent.length - 1] === trackId) return
+    recent.push(trackId)
+    if (recent.length > 24) recent.splice(0, recent.length - 24)
   }
 
   function toggleFavorite(trackId: string) {
@@ -250,6 +353,21 @@ function App() {
   }
 
   function playNext() {
+    if (shuffle) {
+      const pool = remoteTracks.length ? remoteTracks : queue
+      const next = pickWeightedShuffle(pool, behavior, favorites, recentShuffleIdsRef.current.slice(-8))
+      if (!next) {
+        setCurrentId(null)
+        setIsPlaying(false)
+        return
+      }
+      rememberShuffleId(next.id)
+      if (!queue.some((track) => track.id === next.id)) {
+        setQueue(pool)
+      }
+      setCurrentId(next.id)
+      return
+    }
     if (currentIndex < 0 || currentIndex >= queue.length - 1) {
       setCurrentId(null)
       setIsPlaying(false)
@@ -259,6 +377,15 @@ function App() {
   }
 
   function playPrevious() {
+    if (shuffle) {
+      const recent = recentShuffleIdsRef.current
+      const previousId = recent.length >= 2 ? recent[recent.length - 2] : null
+      const previous = previousId ? (remoteTracks.length ? remoteTracks : queue).find((track) => track.id === previousId) : null
+      if (!previous) return
+      maybeRecordSkip()
+      setCurrentId(previous.id)
+      return
+    }
     if (currentIndex <= 0) return
     maybeRecordSkip()
     setCurrentId(queue[currentIndex - 1].id)
@@ -286,8 +413,8 @@ function App() {
   const pageMeta = pageTitle(location.pathname)
 
   return (
-    <div className="app-layout">
-      <audio ref={audioRef} preload="metadata" />
+    <div className={`app-layout${currentTrack ? ' has-player' : ''}`}>
+      <audio ref={audioRef} preload="metadata" crossOrigin="anonymous" />
 
       <aside className="sidebar">
         <div className="brand">
@@ -306,6 +433,10 @@ function App() {
           <NavLink to="/sync" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
             <span className="nav-icon">☁️</span>
             Синк
+          </NavLink>
+          <NavLink to="/trim" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+            <span className="nav-icon">✂️</span>
+            Редактор
           </NavLink>
           <NavLink to="/settings" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
             <span className="nav-icon">⚙️</span>
@@ -399,8 +530,25 @@ function App() {
                 onUpload={uploadFiles}
                 onPlay={(track, tracks) => playSelection(track, tracks ?? remoteTracks)}
                 onToggleFavorite={toggleFavorite}
+                onDelete={(track) => void deleteRemoteTrack(track)}
                 currentId={currentId}
                 favorites={favorites}
+                serverOnline={serverOnline}
+                onServerOnlineChange={setServerOnline}
+              />
+            }
+          />
+          <Route
+            path="/trim"
+            element={
+              <TrimPage
+                serverUrl={serverUrl}
+                tracks={remoteTracks}
+                loadingLibrary={loadingRemote}
+                uploadDir={uploadDir}
+                onUploadDirChange={setUploadDir}
+                onUploaded={refreshRemoteLibrary}
+                onStatus={setStatus}
               />
             }
           />
@@ -411,8 +559,12 @@ function App() {
                 serverUrl={serverUrl}
                 githubRepo={githubRepo}
                 latestRelease={latestRelease}
+                loudnessNormalize={loudnessNormalize}
+                serverOnline={serverOnline}
                 onServerUrlChange={setServerUrl}
                 onGithubRepoChange={setGithubRepo}
+                onLoudnessNormalizeChange={setLoudnessNormalize}
+                onServerOnlineChange={setServerOnline}
                 onRefresh={refreshRemoteLibrary}
                 onRefreshRelease={fetchLatestRelease}
               />
@@ -430,6 +582,10 @@ function App() {
           <span className="nav-icon">☁️</span>
           Синк
         </NavLink>
+        <NavLink to="/trim" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+          <span className="nav-icon">✂️</span>
+          Редактор
+        </NavLink>
         <NavLink to="/settings" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
           <span className="nav-icon">⚙️</span>
           Настройки
@@ -439,7 +595,7 @@ function App() {
       {status ? <div className="toast">{status}</div> : null}
 
       {currentTrack ? (
-        <footer className="player-bar">
+        <footer className="player-bar" ref={playerBarRef}>
           <div className="player-inner">
             <div className="player-top">
               <div className="cover-tile">
@@ -450,6 +606,15 @@ function App() {
                 <span>{currentTrack.artist || 'Неизвестный исполнитель'}</span>
               </div>
               <div className="player-controls">
+                <button
+                  type="button"
+                  className={`player-btn player-btn-icon${shuffle ? ' active' : ''}`}
+                  onClick={() => setShuffle((current) => !current)}
+                  aria-label="Shuffle"
+                  title={shuffle ? 'Случайный (рекомендации)' : 'По порядку'}
+                >
+                  🔀
+                </button>
                 <button type="button" className="player-btn player-btn-icon" onClick={playPrevious} aria-label="Назад">
                   ⏮
                 </button>
@@ -480,6 +645,20 @@ function App() {
                 onChange={seekTo}
               />
               <span>{formatDuration(durationMs)}</span>
+            </div>
+            <div className="volume-wrap" title="Громкость">
+              <span aria-hidden="true">🔊</span>
+              <input
+                className="volumebar"
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={volume}
+                onChange={(event) => setVolume(Number(event.target.value))}
+                aria-label="Громкость"
+              />
+              <span>{Math.round(volume * 100)}%</span>
             </div>
           </div>
         </footer>
@@ -670,7 +849,7 @@ function HomePage(props: {
                   onClick={() => onExpandedGroupChange(expandedGroup === group.key ? null : group.key)}
                 >
                   <TrackArt
-                    track={group.tracks.find((track) => track.artUrl) ?? group.tracks[0]}
+                    track={group.tracks.find((track) => track.youtubeArtUrl || track.artUrl) ?? group.tracks[0]}
                     className="group-art"
                     fallback={group.label}
                   />
@@ -717,9 +896,12 @@ function SyncPage(props: {
   onUpload: (files: FileList | null) => Promise<void>
   onPlay: (track: MusicTrack, tracks?: MusicTrack[]) => void
   onToggleFavorite: (trackId: string) => void
+  onDelete: (track: MusicTrack) => void
   currentId: string | null
   favorites: Set<string>
   sortMode: SortMode
+  serverOnline: boolean | null
+  onServerOnlineChange: (value: boolean | null) => void
 }) {
   const {
     serverUrl,
@@ -730,10 +912,29 @@ function SyncPage(props: {
     onUpload,
     onPlay,
     onToggleFavorite,
+    onDelete,
     currentId,
     favorites,
     sortMode,
+    serverOnline,
+    onServerOnlineChange,
   } = props
+
+  useEffect(() => {
+    let cancelled = false
+    async function ping() {
+      try {
+        const response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/health`)
+        if (!cancelled) onServerOnlineChange(response.ok)
+      } catch {
+        if (!cancelled) onServerOnlineChange(false)
+      }
+    }
+    void ping()
+    return () => {
+      cancelled = true
+    }
+  }, [serverUrl, onServerOnlineChange])
 
   return (
     <section className="page-grid">
@@ -743,18 +944,16 @@ function SyncPage(props: {
             <p className="eyebrow">Orange Pi</p>
             <h2>Удалённая библиотека</h2>
           </div>
+          <div className={`server-status${serverOnline === true ? ' online' : serverOnline === false ? ' offline' : ''}`}>
+            <span className="server-status-dot" aria-hidden="true" />
+            <span>
+              {serverOnline === true ? 'Сервер онлайн' : serverOnline === false ? 'Сервер офлайн' : 'Проверка…'}
+            </span>
+          </div>
         </div>
         <p className="subtitle">
           {loadingRemote ? 'Загружаю список…' : `${remoteTracks.length} треков • ${serverUrl}`}
         </p>
-        <div className="actions" style={{ marginTop: 12 }}>
-          <a className="secondary-button" href={`${serverUrl.replace(/\/$/, '')}/api/health`} target="_blank" rel="noreferrer">
-            API health
-          </a>
-          <a className="secondary-button" href={`${serverUrl.replace(/\/$/, '')}/api/library`} target="_blank" rel="noreferrer">
-            JSON библиотеки
-          </a>
-        </div>
       </article>
 
       <article className="panel">
@@ -809,11 +1008,7 @@ function SyncPage(props: {
                   onPlay={() => onPlay(track, remoteTracks)}
                   onToggleFavorite={() => onToggleFavorite(track.id)}
                 />
-                <div className="actions">
-                  <a className="secondary-button" href={track.remoteUrl} download>
-                    ⬇
-                  </a>
-                </div>
+                <TrackActionsMenu track={track} onDelete={() => onDelete(track)} />
               </div>
             ))}
           </div>
@@ -827,15 +1022,47 @@ function SettingsPage(props: {
   serverUrl: string
   githubRepo: string
   latestRelease: ReleaseInfo | null
+  loudnessNormalize: boolean
+  serverOnline: boolean | null
   onServerUrlChange: (value: string) => void
   onGithubRepoChange: (value: string) => void
+  onLoudnessNormalizeChange: (value: boolean) => void
+  onServerOnlineChange: (value: boolean | null) => void
   onRefresh: () => Promise<void>
   onRefreshRelease: () => Promise<void>
 }) {
-  const { serverUrl, githubRepo, latestRelease, onServerUrlChange, onGithubRepoChange, onRefresh, onRefreshRelease } =
-    props
+  const {
+    serverUrl,
+    githubRepo,
+    latestRelease,
+    loudnessNormalize,
+    serverOnline,
+    onServerUrlChange,
+    onGithubRepoChange,
+    onLoudnessNormalizeChange,
+    onServerOnlineChange,
+    onRefresh,
+    onRefreshRelease,
+  } = props
   const hasDirectoryPicker =
     typeof (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function'
+
+  useEffect(() => {
+    let cancelled = false
+    async function ping() {
+      onServerOnlineChange(null)
+      try {
+        const response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/health`)
+        if (!cancelled) onServerOnlineChange(response.ok)
+      } catch {
+        if (!cancelled) onServerOnlineChange(false)
+      }
+    }
+    void ping()
+    return () => {
+      cancelled = true
+    }
+  }, [serverUrl, onServerOnlineChange])
 
   return (
     <section className="page-grid">
@@ -843,13 +1070,22 @@ function SettingsPage(props: {
         <div className="section-heading">
           <div>
             <p className="eyebrow">Подключение</p>
-            <h2>Orange Pi и обновления</h2>
+            <h2>Пинг сервера</h2>
+          </div>
+          <div className={`server-status${serverOnline === true ? ' online' : serverOnline === false ? ' offline' : ''}`}>
+            <span className="server-status-dot" aria-hidden="true" />
+            <span>
+              {serverOnline === true ? 'Онлайн' : serverOnline === false ? 'Офлайн' : 'Проверка…'}
+            </span>
           </div>
         </div>
         <label className="field">
           Базовый URL сервера
           <input value={serverUrl} onChange={(event) => onServerUrlChange(event.target.value)} />
         </label>
+        <p className="subtitle" style={{ marginTop: -6, marginBottom: 12 }}>
+          Если сайт открыт с Orange Pi (LAN или Tailscale), используется адрес текущей страницы автоматически.
+        </p>
         <label className="field">
           GitHub repo (для APK)
           <input
@@ -859,7 +1095,22 @@ function SettingsPage(props: {
           />
         </label>
         <div className="actions">
-          <button type="button" className="btn btn-primary" onClick={() => void onRefresh()}>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => {
+              void (async () => {
+                onServerOnlineChange(null)
+                try {
+                  const response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/health`)
+                  onServerOnlineChange(response.ok)
+                } catch {
+                  onServerOnlineChange(false)
+                }
+                await onRefresh()
+              })()
+            }}
+          >
             Проверить сервер
           </button>
           <button type="button" className="btn" onClick={() => void onRefreshRelease()}>
@@ -871,6 +1122,26 @@ function SettingsPage(props: {
             Последний APK: {latestRelease.versionName} ({latestRelease.versionCode ?? '?'})
           </p>
         ) : null}
+      </article>
+
+      <article className="panel">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Воспроизведение</p>
+            <h2>Громкость</h2>
+          </div>
+        </div>
+        <label className="toggle-row">
+          <span>
+            <strong>Выравнивать громкость</strong>
+            <span className="subtitle">Автоматически подстраивает уровень разных треков</span>
+          </span>
+          <input
+            type="checkbox"
+            checked={loudnessNormalize}
+            onChange={(event) => onLoudnessNormalizeChange(event.target.checked)}
+          />
+        </label>
       </article>
 
       <article className="panel">
@@ -941,19 +1212,81 @@ function SortSelect(props: { value: SortMode; onChange: (mode: SortMode) => void
   )
 }
 
+function TrackActionsMenu(props: { track: MusicTrack; onDelete: () => void }) {
+  const { track, onDelete } = props
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const close = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener('click', close)
+    return () => document.removeEventListener('click', close)
+  }, [open])
+
+  return (
+    <div className="track-actions" ref={rootRef}>
+      <button
+        type="button"
+        className="secondary-button track-gear"
+        aria-label="Действия с треком"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        ⚙
+      </button>
+      {open ? (
+        <div className="track-actions-menu" role="menu">
+          <a
+            className="track-actions-item"
+            role="menuitem"
+            href={track.remoteUrl}
+            download
+            onClick={() => setOpen(false)}
+          >
+            Скачать
+          </a>
+          <button
+            type="button"
+            className="track-actions-item danger"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false)
+              onDelete()
+            }}
+          >
+            Удалить
+          </button>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function TrackArt(props: { track: MusicTrack; className?: string; fallback?: string }) {
   const { track, className, fallback } = props
-  const [failed, setFailed] = useState(false)
+  // Prefer YouTube thumb when present (many .m4a have no embedded art; Pi can't fetch YT).
+  const sources = [track.youtubeArtUrl, track.artUrl].filter(Boolean) as string[]
+  const [sourceIndex, setSourceIndex] = useState(0)
   const label = (fallback ?? track.title[0] ?? '♪').toUpperCase()
 
-  if (track.artUrl && !failed) {
+  useEffect(() => {
+    setSourceIndex(0)
+  }, [track.id, track.artUrl, track.youtubeArtUrl])
+
+  const src = sources[sourceIndex]
+  if (src) {
     return (
       <img
-        src={track.artUrl}
+        src={src}
         alt=""
         className={className}
-        loading="lazy"
-        onError={() => setFailed(true)}
+        loading="eager"
+        referrerPolicy="no-referrer"
+        onError={() => setSourceIndex((current) => current + 1)}
       />
     )
   }
@@ -1047,10 +1380,15 @@ function pageTitle(pathname: string): { title: string; subtitle: string } {
         title: 'Синхронизация',
         subtitle: 'Библиотека Orange Pi, проигрывание и загрузка файлов с ПК.',
       }
+    case '/trim':
+      return {
+        title: 'Редактор',
+        subtitle: 'Обрезка локального файла и загрузка WAV на Orange Pi.',
+      }
     case '/settings':
       return {
         title: 'Настройки',
-        subtitle: 'Адрес сервера, GitHub repo и проверка APK-обновлений.',
+        subtitle: 'Адрес сервера, громкость и проверка APK-обновлений.',
       }
     default:
       return {
@@ -1080,6 +1418,12 @@ function formatDuration(durationMs: number) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`
 }
 
+function youtubeArtUrlFromPath(path: string) {
+  const matches = [...path.matchAll(/\[(?:-)?([A-Za-z0-9_-]{11})\]/g)]
+  const videoId = matches.at(-1)?.[1]
+  return videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : undefined
+}
+
 function createRemoteTrack(path: string, size: number, mtime: number, baseUrl: string): MusicTrack {
   const parts = path.split('/')
   const fileName = parts.pop() ?? path
@@ -1088,6 +1432,9 @@ function createRemoteTrack(path: string, size: number, mtime: number, baseUrl: s
   const artist = parts.length > 0 ? parts[0] : ''
   const base = baseUrl.replace(/\/$/, '')
   const encodedPath = path.split('/').map(encodeURIComponent).join('/')
+  // Same-origin → relative URLs so Tailscale/LAN switches don't break art/stream.
+  const origin = typeof window !== 'undefined' ? window.location.origin.replace(/\/$/, '') : ''
+  const prefix = origin && base === origin ? '' : base
   return {
     id: `remote:${path}`,
     title,
@@ -1098,7 +1445,8 @@ function createRemoteTrack(path: string, size: number, mtime: number, baseUrl: s
     addedAt: mtime,
     relativePath: path,
     source: 'remote',
-    remoteUrl: `${base}/files/${encodedPath}`,
-    artUrl: `${base}/api/art/${encodedPath}`,
+    remoteUrl: `${prefix}/files/${encodedPath}`,
+    artUrl: `${prefix}/api/art/${encodedPath}?v=${mtime || size}`,
+    youtubeArtUrl: youtubeArtUrlFromPath(path),
   }
 }

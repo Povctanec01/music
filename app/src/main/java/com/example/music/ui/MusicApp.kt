@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Sync
@@ -24,6 +25,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -44,16 +46,22 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.music.MusicApplication
+import com.example.music.data.preferences.AppPreferences
+import com.example.music.domain.art.ServerArtIndex
+import com.example.music.ui.components.LocalServerArtBase
+import com.example.music.ui.components.LocalServerArtIndex
 import com.example.music.ui.library.LibraryScreen
 import com.example.music.ui.player.MiniPlayer
 import com.example.music.ui.player.NowPlayingScreen
 import com.example.music.ui.settings.SettingsScreen
 import com.example.music.ui.sync.SyncScreen
+import com.example.music.ui.trim.TrimScreen
 import kotlinx.coroutines.launch
 
 private object Routes {
     const val Library = "library"
     const val Sync = "sync"
+    const val Trim = "trim"
     const val Settings = "settings"
     const val NowPlaying = "nowPlaying"
 }
@@ -96,6 +104,51 @@ fun MusicApp() {
         (context as? Activity)?.finish()
     }
 
+    var serverArtBase by remember { mutableStateOf<String?>(null) }
+    var serverArtIndex by remember { mutableStateOf(ServerArtIndex.EMPTY) }
+
+    fun refreshServerArtBase() {
+        scope.launch {
+            val lan = preferences.lanUrlOnce()
+            val tail = preferences.tailscaleUrlOnce()
+            val base = container.serverClient.pickEndpoint(lan, tail)?.baseUrl
+                ?: lan.takeIf { it.isNotBlank() }
+                ?: tail.takeIf { it.isNotBlank() }
+            serverArtBase = base
+            serverArtIndex = if (base.isNullOrBlank()) {
+                ServerArtIndex.EMPTY
+            } else {
+                runCatching {
+                    ServerArtIndex.fromLibrary(container.serverClient.library(base))
+                }.getOrDefault(ServerArtIndex.EMPTY)
+            }
+            container.trackArtRepository.updateServerContext(base, serverArtIndex)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        refreshServerArtBase()
+    }
+
+    val tracks by container.libraryRepository.tracks.collectAsStateWithLifecycle()
+
+    LaunchedEffect(tracks, serverArtBase) {
+        val base = serverArtBase ?: return@LaunchedEffect
+        if (tracks.isEmpty()) return@LaunchedEffect
+        val refreshVersion = preferences.sidecarArtRefreshVersionOnce()
+        if (refreshVersion >= AppPreferences.CURRENT_SIDECAR_ART_REFRESH_VERSION) return@LaunchedEffect
+        scope.launch {
+            runCatching { container.serverClient.refreshAllArt(base) }
+            container.trackArtRepository.refreshTracksSidecar(
+                tracks = tracks.take(AppPreferences.FORCE_SIDECAR_REFRESH_TRACK_COUNT),
+                serverBaseUrl = base,
+                force = true,
+            )
+            container.trackArtRepository.reloadTracks(tracks)
+            preferences.setSidecarArtRefreshVersion(AppPreferences.CURRENT_SIDECAR_ART_REFRESH_VERSION)
+        }
+    }
+
     androidx.compose.runtime.DisposableEffect(lifecycleOwner, updates, preferences) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -108,6 +161,7 @@ fun MusicApp() {
                     if (!updates.state.value.checking) {
                         updates.checkForUpdates()
                     }
+                    refreshServerArtBase()
                 }
             }
         }
@@ -115,6 +169,17 @@ fun MusicApp() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    val currentTrack = playback.currentTrack(tracks)
+
+    val shouldShowUpdateDialog = showChrome &&
+        updateState.updateAvailable &&
+        updateState.latestRelease != null &&
+        dismissedTag != updateState.latestRelease?.tagName
+
+    CompositionLocalProvider(
+        LocalServerArtBase provides serverArtBase,
+        LocalServerArtIndex provides serverArtIndex,
+    ) {
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
@@ -122,7 +187,9 @@ fun MusicApp() {
                 Column {
                     MiniPlayer(
                         state = playerState,
+                        track = currentTrack,
                         onTogglePlay = playback::togglePlayPause,
+                        onPrevious = playback::skipPrevious,
                         onNext = playback::skipNext,
                         onOpen = { navController.navigate(Routes.NowPlaying) },
                     )
@@ -138,6 +205,12 @@ fun MusicApp() {
                             onClick = { navController.navigateTop(Routes.Sync) },
                             icon = { Icon(Icons.Default.Sync, contentDescription = null) },
                             label = { Text("Синк") },
+                        )
+                        NavigationBarItem(
+                            selected = route == Routes.Trim,
+                            onClick = { navController.navigateTop(Routes.Trim) },
+                            icon = { Icon(Icons.Default.ContentCut, contentDescription = null) },
+                            label = { Text("Редактор") },
                         )
                         NavigationBarItem(
                             selected = route == Routes.Settings,
@@ -159,17 +232,13 @@ fun MusicApp() {
                 LibraryScreen(onOpenPlayer = { navController.navigate(Routes.NowPlaying) })
             }
             composable(Routes.Sync) { SyncScreen() }
+            composable(Routes.Trim) { TrimScreen() }
             composable(Routes.Settings) { SettingsScreen() }
             composable(Routes.NowPlaying) {
                 NowPlayingScreen(onBack = { navController.popBackStack() })
             }
         }
     }
-
-    val shouldShowUpdateDialog = showChrome &&
-        updateState.updateAvailable &&
-        updateState.latestRelease != null &&
-        dismissedTag != updateState.latestRelease?.tagName
 
     if (shouldShowUpdateDialog) {
         val release = updateState.latestRelease!!
@@ -225,6 +294,7 @@ fun MusicApp() {
                 }
             },
         )
+    }
     }
 }
 

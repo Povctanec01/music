@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,9 +37,11 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -46,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
@@ -54,10 +58,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.music.domain.model.DownloadNetworkMode
 import com.example.music.domain.model.GroupMode
 import kotlin.math.roundToInt
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
+    val context = LocalContext.current
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     var lan by remember { mutableStateOf(state.lanUrl) }
@@ -65,25 +71,42 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         uri?.let(viewModel::selectFolder)
     }
+    val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(state.lanUrl, state.tailscaleUrl) {
         if (lan != state.lanUrl && state.lanUrl.isNotBlank()) lan = state.lanUrl
         if (tailscale != state.tailscaleUrl) tailscale = state.tailscaleUrl
     }
 
+    var didAutoPing by remember { mutableStateOf(false) }
+    // Auto-ping servers once when opening Settings.
+    LaunchedEffect(state.lanUrl, state.tailscaleUrl) {
+        if (didAutoPing) return@LaunchedEffect
+        if (state.lanUrl.isNotBlank() || state.tailscaleUrl.isNotBlank()) {
+            didAutoPing = true
+            viewModel.checkConnection(
+                lan.ifBlank { state.lanUrl },
+                tailscale.ifBlank { state.tailscaleUrl },
+            )
+        }
+    }
+
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = { TopAppBar(title = { Text("Настройки") }) },
     ) { padding ->
+        var draggingIndex by remember { mutableStateOf<Int?>(null) }
+
         Column(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
                 .padding(horizontal = 16.dp)
-                .verticalScroll(rememberScrollState()),
+                .verticalScroll(scrollState, enabled = draggingIndex == null),
         ) {
             ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp)) {
+                Column(modifier = Modifier.padding(16.dp)) {
                     Text("Локальная папка", style = MaterialTheme.typography.titleMedium)
                     Text(
                         state.folderUri ?: "Папка не выбрана",
@@ -98,7 +121,13 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
             Spacer(Modifier.height(24.dp))
             ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("Сервер Orange Pi", style = MaterialTheme.typography.titleMedium)
+                    Text("Пинг сервера", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "При открытии настроек серверы проверяются автоматически.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
                     OutlinedTextField(
                         value = lan,
                         onValueChange = { lan = it },
@@ -132,9 +161,9 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
                 }
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(Modifier.height(24.dp))
             ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp)) {
+                Column(modifier = Modifier.padding(16.dp)) {
                     Text("APK обновления", style = MaterialTheme.typography.titleMedium)
                     Text(
                         "Приложение само проверяет новые версии при запуске. Android всё равно покажет системный экран установки.",
@@ -200,14 +229,17 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
                     val itemStepPx = with(density) { (itemHeight + 8.dp).toPx() }
 
                     var localOrder by remember { mutableStateOf(state.groupModeOrder) }
-                    var draggingIndex by remember { mutableStateOf<Int?>(null) }
                     var dragOffsetY by remember { mutableFloatStateOf(0f) }
                     var orderBeforeDrag by remember { mutableStateOf<List<GroupMode>?>(null) }
+                    var pendingSave by remember { mutableStateOf(false) }
 
-                    // Keep settings list in sync with preferences, but never while a drag is active.
-                    LaunchedEffect(state.groupModeOrder, draggingIndex) {
-                        if (draggingIndex == null) {
+                    // Keep settings list in sync with preferences, but never while a drag/save is active.
+                    LaunchedEffect(state.groupModeOrder, draggingIndex, pendingSave) {
+                        if (draggingIndex == null && !pendingSave) {
                             localOrder = state.groupModeOrder
+                        }
+                        if (pendingSave && localOrder == state.groupModeOrder) {
+                            pendingSave = false
                         }
                     }
 
@@ -219,89 +251,100 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         localOrder.forEachIndexed { index, mode ->
-                            val isDragging = draggingIndex == index
-                            ElevatedCard(
-                                colors = CardDefaults.elevatedCardColors(
-                                    containerColor = if (isDragging) {
-                                        MaterialTheme.colorScheme.primaryContainer
-                                    } else {
-                                        MaterialTheme.colorScheme.surface
-                                    },
-                                ),
-                                elevation = CardDefaults.elevatedCardElevation(
-                                    defaultElevation = if (isDragging) 10.dp else 2.dp,
-                                ),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(itemHeight)
-                                    .graphicsLayer {
-                                        translationY = if (isDragging) dragOffsetY else 0f
-                                        scaleX = if (isDragging) 1.02f else 1f
-                                        scaleY = if (isDragging) 1.02f else 1f
-                                    },
-                            ) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .padding(horizontal = 16.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    // Key only by mode so gesture survives multi-step reorders.
-                                    DragHandle(
-                                        active = isDragging,
-                                        modifier = Modifier.pointerInput(mode) {
-                                            detectDragGesturesAfterLongPress(
-                                                onDragStart = {
-                                                    val startIndex = latestOrder.indexOf(mode)
-                                                    if (startIndex >= 0) {
-                                                        orderBeforeDrag = latestOrder
-                                                        draggingIndex = startIndex
-                                                        dragOffsetY = 0f
-                                                    }
-                                                },
-                                                onDragCancel = {
-                                                    orderBeforeDrag?.let { localOrder = it }
-                                                    orderBeforeDrag = null
-                                                    draggingIndex = null
-                                                    dragOffsetY = 0f
-                                                },
-                                                onDragEnd = {
-                                                    val finalOrder = latestOrder
-                                                    orderBeforeDrag = null
-                                                    draggingIndex = null
-                                                    dragOffsetY = 0f
-                                                    viewModel.setGroupModeOrder(finalOrder)
-                                                },
-                                                onDrag = { change, dragAmount ->
-                                                    val from = latestDraggingIndex
-                                                        ?: return@detectDragGesturesAfterLongPress
-                                                    dragOffsetY += dragAmount.y
-                                                    val current = latestOrder
-                                                    val target = (from + (dragOffsetY / itemStepPx).roundToInt())
-                                                        .coerceIn(0, current.lastIndex)
-                                                    if (target != from) {
-                                                        val next = current.toMutableList().apply {
-                                                            add(target, removeAt(from))
-                                                        }
-                                                        localOrder = next
-                                                        draggingIndex = target
-                                                        dragOffsetY -= (target - from) * itemStepPx
-                                                    }
-                                                    change.consume()
-                                                },
-                                            )
-                                        },
-                                    )
-                                    Spacer(modifier = Modifier.width(16.dp))
-                                    Text(
-                                        mode.label(),
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        color = if (isDragging) {
-                                            MaterialTheme.colorScheme.onPrimaryContainer
+                            key(mode) {
+                                val isDragging = draggingIndex == index
+                                ElevatedCard(
+                                    colors = CardDefaults.elevatedCardColors(
+                                        containerColor = if (isDragging) {
+                                            MaterialTheme.colorScheme.primaryContainer
                                         } else {
-                                            MaterialTheme.colorScheme.onSurface
+                                            MaterialTheme.colorScheme.surface
                                         },
-                                    )
+                                    ),
+                                    elevation = CardDefaults.elevatedCardElevation(
+                                        defaultElevation = if (isDragging) 10.dp else 2.dp,
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(itemHeight)
+                                        .graphicsLayer {
+                                            translationY = if (isDragging) dragOffsetY else 0f
+                                            scaleX = if (isDragging) 1.02f else 1f
+                                            scaleY = if (isDragging) 1.02f else 1f
+                                        },
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(horizontal = 16.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        DragHandle(
+                                            active = isDragging,
+                                            modifier = Modifier.pointerInput(mode) {
+                                                detectDragGesturesAfterLongPress(
+                                                    onDragStart = {
+                                                        val startIndex = latestOrder.indexOf(mode)
+                                                        if (startIndex >= 0) {
+                                                            orderBeforeDrag = latestOrder
+                                                            draggingIndex = startIndex
+                                                            dragOffsetY = 0f
+                                                        }
+                                                    },
+                                                    onDragCancel = {
+                                                        orderBeforeDrag?.let { localOrder = it }
+                                                        orderBeforeDrag = null
+                                                        draggingIndex = null
+                                                        dragOffsetY = 0f
+                                                        pendingSave = false
+                                                    },
+                                                    onDragEnd = {
+                                                        val finalOrder = latestOrder
+                                                        orderBeforeDrag = null
+                                                        dragOffsetY = 0f
+                                                        pendingSave = true
+                                                        viewModel.setGroupModeOrder(finalOrder)
+                                                        draggingIndex = null
+                                                    },
+                                                    onDrag = { change, dragAmount ->
+                                                        val from = latestDraggingIndex
+                                                            ?: return@detectDragGesturesAfterLongPress
+                                                        dragOffsetY += dragAmount.y
+                                                        val current = latestOrder
+                                                        val target = (from + (dragOffsetY / itemStepPx).roundToInt())
+                                                            .coerceIn(0, current.lastIndex)
+                                                        if (target != from) {
+                                                            val next = current.toMutableList().apply {
+                                                                add(target, removeAt(from))
+                                                            }
+                                                            localOrder = next
+                                                            draggingIndex = target
+                                                            dragOffsetY -= (target - from) * itemStepPx
+                                                            // Keep dragged row visible if near edges.
+                                                            scope.launch {
+                                                                if (dragOffsetY > itemStepPx) {
+                                                                    scrollState.scrollBy(itemStepPx / 2)
+                                                                } else if (dragOffsetY < -itemStepPx) {
+                                                                    scrollState.scrollBy(-itemStepPx / 2)
+                                                                }
+                                                            }
+                                                        }
+                                                        change.consume()
+                                                    },
+                                                )
+                                            },
+                                        )
+                                        Spacer(modifier = Modifier.width(16.dp))
+                                        Text(
+                                            mode.label(),
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            color = if (isDragging) {
+                                                MaterialTheme.colorScheme.onPrimaryContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurface
+                                            },
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -317,6 +360,19 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
             }
 
             Spacer(Modifier.height(32.dp))
+
+            val appVersion = remember {
+                runCatching {
+                    val ctx = context
+                    ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName
+                }.getOrDefault("?")
+            }
+            Text(
+                "Версия приложения: $appVersion",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 16.dp),
+            )
         }
     }
 }

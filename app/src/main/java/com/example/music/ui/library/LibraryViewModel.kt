@@ -57,6 +57,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     private val sortMode = MutableStateFlow(SortMode.ARTIST)
     private val groupMode = MutableStateFlow(GroupMode.TRACKS)
     private val groupOrder = MutableStateFlow(GroupMode.entries.toList())
+    private var libraryTracks: List<Track> = emptyList()
 
     private val core = combine(
         combine(
@@ -111,7 +112,20 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     init {
         viewModelScope.launch {
             library.tracks.collect { tracks ->
+                libraryTracks = tracks
+                if (playback.state.value.shuffle && tracks.isNotEmpty()) {
+                    playback.setShufflePool(tracks)
+                }
                 playback.restoreIfNeeded(tracks)
+            }
+        }
+        viewModelScope.launch {
+            var wasShuffle = false
+            playback.state.collect { state ->
+                if (state.shuffle && !wasShuffle && libraryTracks.isNotEmpty()) {
+                    playback.setShufflePool(libraryTracks)
+                }
+                wasShuffle = state.shuffle
             }
         }
         viewModelScope.launch {
@@ -164,8 +178,19 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun play(track: Track, queue: List<Track>) {
-        val index = queue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
-        playback.play(queue, index)
+        val pool = if (playback.state.value.shuffle && libraryTracks.size > 1) {
+            libraryTracks
+        } else {
+            queue
+        }
+        var index = pool.indexOfFirst { it.id == track.id }
+        val finalPool = if (index < 0) {
+            index = 0
+            listOf(track) + pool.filter { it.id != track.id }
+        } else {
+            pool
+        }
+        playback.play(finalPool, index)
     }
 
     fun playNext(track: Track) {
@@ -174,6 +199,13 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     fun toggleFavorite(trackId: String) {
         viewModelScope.launch { preferences.toggleFavorite(trackId) }
+    }
+
+    fun deleteTrack(track: Track, onResult: (Boolean) -> Unit = {}) {
+        viewModelScope.launch {
+            val deleted = runCatching { library.deleteTrack(track) }.getOrDefault(false)
+            onResult(deleted)
+        }
     }
 
     private fun filterAndSort(

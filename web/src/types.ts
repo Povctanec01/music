@@ -11,6 +11,7 @@ export type MusicTrack = {
   source: TrackSource
   addedAt: number
   artUrl?: string
+  youtubeArtUrl?: string
   objectUrl?: string
   remoteUrl?: string
   file?: File

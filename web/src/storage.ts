@@ -33,7 +33,22 @@ export function saveBehavior(behavior: Record<string, ListeningBehavior>) {
 }
 
 export function loadServerUrl() {
-  return localStorage.getItem(SERVER_URL_KEY) ?? 'http://192.168.1.80:8080'
+  const saved = localStorage.getItem(SERVER_URL_KEY)
+  if (typeof window === 'undefined') {
+    return saved ?? 'http://192.168.1.80:8080'
+  }
+
+  const origin = window.location.origin
+  const host = window.location.hostname
+  const isLocalDev = host === 'localhost' || host === '127.0.0.1'
+
+  // Site is served from Orange Pi itself (LAN or Tailscale).
+  // Always use the current page origin so switching IPs just works.
+  if (!isLocalDev) {
+    return origin
+  }
+
+  return saved ?? 'http://192.168.1.80:8080'
 }
 
 export function saveServerUrl(url: string) {
@@ -62,4 +77,27 @@ export function loadSortMode() {
 
 export function saveSortMode(mode: string) {
   localStorage.setItem(SORT_MODE_KEY, mode)
+}
+
+const VOLUME_KEY = 'music-web-volume'
+
+export function loadVolume() {
+  const raw = localStorage.getItem(VOLUME_KEY)
+  const value = raw == null ? 1 : Number(raw)
+  if (!Number.isFinite(value)) return 1
+  return Math.min(1, Math.max(0, value))
+}
+
+export function saveVolume(volume: number) {
+  localStorage.setItem(VOLUME_KEY, String(Math.min(1, Math.max(0, volume))))
+}
+
+const SHUFFLE_KEY = 'music-web-shuffle'
+
+export function loadShuffle() {
+  return localStorage.getItem(SHUFFLE_KEY) === '1'
+}
+
+export function saveShuffle(enabled: boolean) {
+  localStorage.setItem(SHUFFLE_KEY, enabled ? '1' : '0')
 }

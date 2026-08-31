@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -45,6 +46,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
@@ -83,6 +85,7 @@ fun LibraryScreen(
     var searchOpen by remember { mutableStateOf(false) }
     var sortMenu by remember { mutableStateOf(false) }
     var swapFrom by remember { mutableStateOf<GroupMode?>(null) }
+    var trackToDelete by remember { mutableStateOf<Track?>(null) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         uri?.let(viewModel::selectFolder)
     }
@@ -262,6 +265,7 @@ fun LibraryScreen(
                                         },
                                         onFavorite = { viewModel.toggleFavorite(row.track.id) },
                                         onPlayNext = { viewModel.playNext(row.track) },
+                                        onDelete = { trackToDelete = row.track },
                                     )
                                 }
                             }
@@ -270,6 +274,32 @@ fun LibraryScreen(
                 }
             }
         }
+    }
+
+    trackToDelete?.let { track ->
+        AlertDialog(
+            onDismissRequest = { trackToDelete = null },
+            title = { Text("Удалить с телефона?") },
+            text = {
+                Text("Файл «${track.title}» и его обложка будут удалены с устройства.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val target = track
+                        trackToDelete = null
+                        viewModel.deleteTrack(target)
+                    },
+                ) {
+                    Text("Удалить")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { trackToDelete = null }) {
+                    Text("Отмена")
+                }
+            },
+        )
     }
 }
 
@@ -457,6 +487,7 @@ private fun TrackRow(
     onClick: () -> Unit,
     onFavorite: () -> Unit,
     onPlayNext: () -> Unit,
+    onDelete: () -> Unit,
 ) {
     var menu by remember { mutableStateOf(false) }
     Surface(
@@ -506,6 +537,13 @@ private fun TrackRow(
                                 text = { Text("Играть следующим") },
                                 onClick = {
                                     onPlayNext()
+                                    menu = false
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Удалить с телефона") },
+                                onClick = {
+                                    onDelete()
                                     menu = false
                                 },
                             )

@@ -3,8 +3,6 @@ package com.example.music.player
 import android.content.ComponentName
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.core.content.ContextCompat
 import androidx.media3.common.C
@@ -15,6 +13,8 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.example.music.data.preferences.AppPreferences
 import com.example.music.domain.model.Track
+import com.example.music.domain.metadata.TrackMetadataReader
+import com.example.music.domain.recommendation.ShufflePicker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,6 +26,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.collections.ArrayDeque
+import kotlin.random.Random
 
 data class PlayerUiState(
     val connected: Boolean = false,
@@ -64,6 +66,11 @@ class PlaybackController(
     private var lastTrackedPositionMs: Long = 0L
     private var pendingListenedMs: Long = 0L
     private var completedTrackIds = mutableSetOf<String>()
+    /** Full pool used for weighted shuffle / radio mode. */
+    private var shufflePool: List<Track> = emptyList()
+    private var shuffleEnabled = false
+    private val recentShuffleIds = ArrayDeque<String>()
+    private var advancingWeighted = false
 
     private val _state = MutableStateFlow(PlayerUiState())
     val state: StateFlow<PlayerUiState> = _state.asStateFlow()
@@ -73,6 +80,12 @@ class PlaybackController(
             trackListeningSignals(player)
             publish(player)
             persist(player)
+            if (shuffleEnabled && events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION)) {
+                val currentId = player.currentMediaItem?.mediaId
+                if (currentId != null) rememberRecent(currentId)
+                scope.launch { maintainShuffleQueue(player) }
+            }
+            maybeContinueWeightedShuffle(player)
         }
     }
 
@@ -85,7 +98,12 @@ class PlaybackController(
                 val mediaController = future.get()
                 controller = mediaController
                 mediaController.addListener(listener)
-                publish(mediaController)
+                scope.launch {
+                    val snapshot = preferences.playbackSnapshot()
+                    shuffleEnabled = snapshot.shuffle
+                    mediaController.shuffleModeEnabled = false
+                    publish(mediaController)
+                }
                 startPositionUpdates()
             } catch (_: Exception) {
             }
@@ -96,16 +114,47 @@ class PlaybackController(
         val player = controller ?: return
         if (tracks.isEmpty()) return
         val safeIndex = index.coerceIn(0, tracks.lastIndex)
-        player.setMediaItems(tracks.map { it.toMediaItem() }, safeIndex, C.TIME_UNSET)
-        player.prepare()
-        player.play()
-        scope.launch {
-            preferences.savePlayback(tracks.map { it.id }, safeIndex, 0L, tracks[safeIndex].id)
+        shufflePool = tracks
+        rememberRecent(tracks[safeIndex].id)
+        if (shuffleEnabled) {
+            scope.launch {
+                val queue = buildShuffleQueue(tracks[safeIndex])
+                player.shuffleModeEnabled = false
+                player.repeatMode = Player.REPEAT_MODE_OFF
+                val startIndex = queue.indexOfFirst { it.id == tracks[safeIndex].id }.coerceAtLeast(0)
+                player.setMediaItems(queue.map { it.toMediaItem() }, startIndex, C.TIME_UNSET)
+                player.prepare()
+                player.play()
+                preferences.savePlayback(
+                    queueIds = queue.map { it.id },
+                    index = startIndex,
+                    positionMs = 0L,
+                    mediaId = tracks[safeIndex].id,
+                )
+            }
+        } else {
+            player.setMediaItems(tracks.map { it.toMediaItem() }, safeIndex, C.TIME_UNSET)
+            player.prepare()
+            player.play()
+            scope.launch {
+                preferences.savePlayback(tracks.map { it.id }, safeIndex, 0L, tracks[safeIndex].id)
+            }
         }
+    }
+
+    /** Expand / refresh the pool used by weighted shuffle (typically full library). */
+    fun setShufflePool(tracks: List<Track>) {
+        if (tracks.isEmpty()) return
+        shufflePool = tracks
     }
 
     fun playNext(track: Track) {
         val player = controller ?: return
+        if (shuffleEnabled) {
+            shufflePool = (listOf(track) + shufflePool.filter { it.id != track.id })
+            scope.launch { playWeightedTrack(track) }
+            return
+        }
         val insertAt = (player.currentMediaItemIndex + 1).coerceAtMost(player.mediaItemCount)
         player.addMediaItem(insertAt, track.toMediaItem())
     }
@@ -116,11 +165,35 @@ class PlaybackController(
     }
 
     fun skipNext() {
-        controller?.seekToNext()
+        val player = controller ?: return
+        if (shuffleEnabled) {
+            if (player.hasNextMediaItem()) {
+                player.seekToNextMediaItem()
+            } else {
+                scope.launch { advanceWeighted(player) }
+            }
+            return
+        }
+        if (player.hasNextMediaItem()) {
+            player.seekToNext()
+        }
     }
 
     fun skipPrevious() {
-        controller?.seekToPrevious()
+        val player = controller ?: return
+        if (shuffleEnabled) {
+            if (player.hasPreviousMediaItem()) {
+                player.seekToPreviousMediaItem()
+                return
+            }
+            val previousId = recentShuffleIds.elementAtOrNull(recentShuffleIds.size - 2)
+            val previous = previousId?.let { id -> shufflePool.firstOrNull { it.id == id } }
+            if (previous != null) {
+                scope.launch { playWeightedTrack(previous, recordRecent = false) }
+            }
+            return
+        }
+        player.seekToPrevious()
     }
 
     fun seekTo(positionMs: Long) {
@@ -129,13 +202,44 @@ class PlaybackController(
 
     fun toggleShuffle() {
         val player = controller ?: return
-        val enabled = !player.shuffleModeEnabled
-        player.shuffleModeEnabled = enabled
-        scope.launch { preferences.setShuffle(enabled) }
+        shuffleEnabled = !shuffleEnabled
+        // Weighted radio owns ordering; keep ExoPlayer shuffle off to avoid edge stops.
+        player.shuffleModeEnabled = false
+        scope.launch { preferences.setShuffle(shuffleEnabled) }
+        if (shuffleEnabled) {
+            val currentId = player.currentMediaItem?.mediaId
+            val current = currentId?.let { id -> shufflePool.firstOrNull { it.id == id } }
+            if (current != null) {
+                scope.launch {
+                    val queue = buildShuffleQueue(current)
+                    val startIndex = queue.indexOfFirst { it.id == current.id }.coerceAtLeast(0)
+                    player.repeatMode = Player.REPEAT_MODE_OFF
+                    player.setMediaItems(
+                        queue.map { it.toMediaItem() },
+                        startIndex,
+                        player.currentPosition.coerceAtLeast(0L),
+                    )
+                    player.prepare()
+                    if (_state.value.isPlaying) player.play()
+                }
+            }
+        } else if (shufflePool.isNotEmpty()) {
+            val currentId = player.currentMediaItem?.mediaId
+            val index = shufflePool.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+            player.setMediaItems(
+                shufflePool.map { it.toMediaItem() },
+                index,
+                player.currentPosition.coerceAtLeast(0L),
+            )
+            player.prepare()
+            if (_state.value.isPlaying) player.play()
+        }
+        publish(player)
     }
 
     fun cycleRepeat() {
         val player = controller ?: return
+        if (shuffleEnabled) return
         val next = when (player.repeatMode) {
             Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
             Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
@@ -158,6 +262,38 @@ class PlaybackController(
         if (index in 0 until player.mediaItemCount) {
             player.removeMediaItem(index)
         }
+    }
+
+    fun removeFromQueue(trackId: String) {
+        val player = controller ?: return
+        var index = player.currentMediaItemIndex
+        while (index < player.mediaItemCount) {
+            val itemIndex = (index until player.mediaItemCount).firstOrNull { idx ->
+                player.getMediaItemAt(idx).mediaId == trackId
+            } ?: break
+            val removingCurrent = itemIndex == player.currentMediaItemIndex
+            player.removeMediaItem(itemIndex)
+            if (player.mediaItemCount == 0) {
+                player.stop()
+                player.clearMediaItems()
+                publish(player)
+                return
+            }
+            if (removingCurrent) {
+                val nextIndex = itemIndex.coerceAtMost(player.mediaItemCount - 1)
+                player.seekToDefaultPosition(nextIndex)
+            }
+            index = itemIndex
+        }
+        publish(player)
+    }
+
+    /** Stop and detach a track from the player before its file is deleted from storage. */
+    fun releaseTrackIfPlaying(trackId: String) {
+        val player = controller ?: return
+        if (player.currentMediaItem?.mediaId != trackId) return
+        player.pause()
+        removeFromQueue(trackId)
     }
 
     fun startSleepTimer(durationMs: Long, fade: Boolean) {
@@ -200,10 +336,21 @@ class PlaybackController(
             restored = true
             return
         }
+        shufflePool = if (tracks.size >= restoredTracks.size) tracks else restoredTracks
+        shuffleEnabled = snapshot.shuffle
+        player.shuffleModeEnabled = false
         val index = snapshot.index.coerceIn(0, restoredTracks.lastIndex)
-        player.shuffleModeEnabled = snapshot.shuffle
-        player.repeatMode = snapshot.repeatMode
-        player.setMediaItems(restoredTracks.map { it.toMediaItem() }, index, snapshot.positionMs)
+        if (shuffleEnabled) {
+            val current = restoredTracks[index]
+            rememberRecent(current.id)
+            val queue = buildShuffleQueue(current)
+            val startIndex = queue.indexOfFirst { it.id == current.id }.coerceAtLeast(0)
+            player.repeatMode = Player.REPEAT_MODE_OFF
+            player.setMediaItems(queue.map { it.toMediaItem() }, startIndex, snapshot.positionMs)
+        } else {
+            player.repeatMode = snapshot.repeatMode
+            player.setMediaItems(restoredTracks.map { it.toMediaItem() }, index, snapshot.positionMs)
+        }
         player.prepare()
         player.pause()
         restored = true
@@ -213,6 +360,117 @@ class PlaybackController(
     fun currentTrack(tracks: List<Track>): Track? {
         val id = _state.value.currentId ?: return null
         return tracks.firstOrNull { it.id == id }
+    }
+
+    private fun maybeContinueWeightedShuffle(player: Player) {
+        if (!shuffleEnabled || advancingWeighted) return
+        if (player.playbackState != Player.STATE_ENDED) return
+        if (player.hasNextMediaItem()) return
+        scope.launch { advanceWeighted(player) }
+    }
+
+    private suspend fun advanceWeighted(player: Player) {
+        if (advancingWeighted) return
+        val pool = shufflePool
+        if (pool.isEmpty()) return
+        advancingWeighted = true
+        try {
+            val behavior = preferences.listeningBehaviorOnce()
+            val favorites = preferences.favoritesOnce()
+            val exclude = recentShuffleIds.toList().takeLast(8)
+            val next = ShufflePicker.pickNext(
+                pool = pool,
+                behavior = behavior,
+                favorites = favorites,
+                excludeIds = exclude,
+                random = Random.Default,
+            ) ?: return
+            playWeightedTrack(next)
+        } finally {
+            advancingWeighted = false
+        }
+    }
+
+    private suspend fun playWeightedTrack(track: Track, recordRecent: Boolean = true) {
+        val player = controller ?: return
+        if (recordRecent) rememberRecent(track.id)
+        val queue = buildShuffleQueue(track)
+        val startIndex = queue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
+        player.shuffleModeEnabled = false
+        player.repeatMode = Player.REPEAT_MODE_OFF
+        player.setMediaItems(queue.map { it.toMediaItem() }, startIndex, C.TIME_UNSET)
+        player.prepare()
+        player.play()
+        preferences.savePlayback(
+            queueIds = queue.map { it.id },
+            index = startIndex,
+            positionMs = 0L,
+            mediaId = track.id,
+        )
+    }
+
+    private suspend fun buildShuffleQueue(startTrack: Track, upcomingCount: Int = 4): List<Track> {
+        val pool = shufflePool
+        if (pool.isEmpty()) return listOf(startTrack)
+
+        val queue = mutableListOf<Track>()
+        val previousId = recentShuffleIds.elementAtOrNull(recentShuffleIds.size - 2)
+        val previous = previousId?.let { id -> pool.firstOrNull { it.id == id } }
+        if (previous != null && previous.id != startTrack.id) {
+            queue += previous
+        }
+        queue += startTrack
+
+        val behavior = preferences.listeningBehaviorOnce()
+        val favorites = preferences.favoritesOnce()
+        val exclude = (recentShuffleIds.toList().takeLast(8) + queue.map { it.id }).toMutableSet()
+        repeat(upcomingCount) {
+            val next = ShufflePicker.pickNext(
+                pool = pool,
+                behavior = behavior,
+                favorites = favorites,
+                excludeIds = exclude.toList(),
+                random = Random.Default,
+            ) ?: return@repeat
+            queue += next
+            exclude += next.id
+        }
+        return queue
+    }
+
+    private suspend fun maintainShuffleQueue(player: Player) {
+        if (!shuffleEnabled || shufflePool.isEmpty()) return
+        if (player.mediaItemCount > 8 && player.currentMediaItemIndex > 2) {
+            player.removeMediaItem(0)
+        }
+        val trailing = player.mediaItemCount - (player.currentMediaItemIndex + 1)
+        if (trailing >= 3) return
+
+        val behavior = preferences.listeningBehaviorOnce()
+        val favorites = preferences.favoritesOnce()
+        val exclude = (
+            recentShuffleIds.toList().takeLast(8) +
+                List(player.mediaItemCount) { player.getMediaItemAt(it).mediaId }
+            ).toMutableSet()
+        repeat(3 - trailing) {
+            val next = ShufflePicker.pickNext(
+                pool = shufflePool,
+                behavior = behavior,
+                favorites = favorites,
+                excludeIds = exclude.toList(),
+                random = Random.Default,
+            ) ?: return
+            player.addMediaItem(next.toMediaItem())
+            exclude += next.id
+        }
+    }
+
+    private fun rememberRecent(trackId: String) {
+        if (recentShuffleIds.lastOrNull() == trackId) return
+        recentShuffleIds.addLast(trackId)
+        while (recentShuffleIds.size > 24) {
+            recentShuffleIds.removeFirst()
+        }
     }
 
     private suspend fun waitForController(): MediaController? {
@@ -342,7 +600,7 @@ class PlaybackController(
             album = metadata.albumTitle?.toString().orEmpty(),
             durationMs = player.duration.takeIf { it != C.TIME_UNSET } ?: 0L,
             positionMs = player.currentPosition.coerceAtLeast(0L),
-            shuffle = player.shuffleModeEnabled,
+            shuffle = shuffleEnabled,
             repeatMode = player.repeatMode,
             queueSize = player.mediaItemCount,
             currentIndex = player.currentMediaItemIndex.coerceAtLeast(0),
@@ -391,22 +649,8 @@ fun Track.toMediaItem(): MediaItem =
         )
         .build()
 
-fun loadEmbeddedArt(context: Context, uri: Uri): Bitmap? {
-    val retriever = MediaMetadataRetriever()
-    return try {
-        retriever.setDataSource(context, uri)
-        retriever.embeddedPicture?.let { bytes ->
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        }
-    } catch (_: Exception) {
-        null
-    } finally {
-        try {
-            retriever.release()
-        } catch (_: Exception) {
-        }
-    }
-}
+fun loadEmbeddedArt(context: Context, uri: Uri): Bitmap? =
+    TrackMetadataReader.readEmbeddedArt(context, uri)
 
 suspend fun loadEmbeddedArtAsync(context: Context, uri: Uri): Bitmap? =
     withContext(Dispatchers.IO) { loadEmbeddedArt(context, uri) }

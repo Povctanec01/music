@@ -227,6 +227,15 @@ class AppPreferences(
         }
     }
 
+    suspend fun sidecarArtRefreshVersionOnce(): Int =
+        dataStore.data.first()[Keys.SIDECAR_ART_REFRESH_VERSION] ?: 0
+
+    suspend fun setSidecarArtRefreshVersion(version: Int) {
+        dataStore.edit { prefs ->
+            prefs[Keys.SIDECAR_ART_REFRESH_VERSION] = version
+        }
+    }
+
     private suspend fun mutateTrackBehavior(
         trackId: String,
         update: (TrackBehavior) -> TrackBehavior,
@@ -263,12 +272,16 @@ class AppPreferences(
         val CACHED_LIBRARY = stringPreferencesKey("cached_library")
         val PENDING_UPDATE_RESTART = booleanPreferencesKey("pending_update_restart")
         val PENDING_UPDATE_TARGET_VERSION_CODE = intPreferencesKey("pending_update_target_version_code")
+        val SIDECAR_ART_REFRESH_VERSION = intPreferencesKey("sidecar_art_refresh_version")
     }
 
     companion object {
         const val DEFAULT_LAN_URL = "http://192.168.1.80:8080"
         const val DEFAULT_TAILSCALE_URL = "http://100.106.26.26:8080"
         const val DEFAULT_GITHUB_REPO = "Povctanec01/music"
+        /** One-time forced sidecar refresh for existing local library tracks. */
+        const val CURRENT_SIDECAR_ART_REFRESH_VERSION = 2
+        const val FORCE_SIDECAR_REFRESH_TRACK_COUNT = 14
 
         fun normalizeGroupModeOrder(order: List<GroupMode>): List<GroupMode> {
             val seen = linkedSetOf<GroupMode>()

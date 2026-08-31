@@ -9,6 +9,8 @@ import com.example.music.data.preferences.AppPreferences
 import com.example.music.data.remote.NetworkMonitor
 import com.example.music.data.remote.ServerClient
 import com.example.music.data.update.AppUpdateManager
+import com.example.music.domain.art.SidecarArtSync
+import com.example.music.domain.art.TrackArtRepository
 import com.example.music.domain.recommendation.RecommendationEngine
 import com.example.music.player.PlaybackController
 import kotlinx.serialization.json.Json
@@ -26,10 +28,19 @@ class AppContainer(context: Context) {
     val scanner = MusicScanner(appContext)
     val safStorage = SafStorage(appContext)
     val serverClient = ServerClient(json)
+    val sidecarArtSync = SidecarArtSync(appContext, preferences, safStorage, serverClient)
+    val trackArtRepository = TrackArtRepository(appContext, sidecarArtSync)
     val networkMonitor = NetworkMonitor(appContext)
-    val libraryRepository = LibraryRepository(appContext, preferences, scanner)
-    val recommendationEngine = RecommendationEngine()
     val playbackController = PlaybackController(appContext, preferences)
+    val libraryRepository = LibraryRepository(
+        context = appContext,
+        preferences = preferences,
+        scanner = scanner,
+        storage = safStorage,
+        trackArtRepository = trackArtRepository,
+        playbackController = playbackController,
+    )
+    val recommendationEngine = RecommendationEngine()
     val appUpdateManager = AppUpdateManager(appContext, preferences, serverClient)
     val downloadManager = DownloadManager(
         context = appContext,
@@ -37,7 +48,9 @@ class AppContainer(context: Context) {
         server = serverClient,
         storage = safStorage,
         network = networkMonitor,
-        onFinished = { libraryRepository.scan() },
+        sidecarArtSync = sidecarArtSync,
+        trackArtRepository = trackArtRepository,
+        onFinished = { libraryRepository.scan(showLoading = false) },
     )
 
     fun start() {

@@ -1,20 +1,15 @@
 package com.example.music.ui.components
 
-import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -23,21 +18,61 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.music.MusicApplication
+import com.example.music.domain.art.TrackArtRepository
 import com.example.music.domain.model.Track
-import com.example.music.player.loadEmbeddedArtAsync
 
 @Composable
 fun TrackArtwork(
     track: Track,
     modifier: Modifier = Modifier,
     cornerSize: Dp = 20.dp,
+    fallbackLabel: String? = null,
 ) {
-    val context = LocalContext.current
-    var cover by remember(track.id) { mutableStateOf<Bitmap?>(null) }
-
-    LaunchedEffect(track.id, track.uri) {
-        cover = loadEmbeddedArtAsync(context, track.uri)
+    val repo = (LocalContext.current.applicationContext as MusicApplication).container.trackArtRepository
+    LaunchedEffect(track.relativePath) {
+        repo.ensureLoadedForTrack(track)
     }
+    TrackArtworkContent(
+        artState = repo.observeForTrack(track),
+        modifier = modifier,
+        cornerSize = cornerSize,
+        fallbackLabel = fallbackLabel ?: track.title.firstOrNull()?.uppercase(),
+    )
+}
+
+@Composable
+fun TrackArtworkFromPath(
+    relativePath: String,
+    version: Long,
+    modifier: Modifier = Modifier,
+    cornerSize: Dp = 20.dp,
+    fallbackLabel: String? = null,
+    embeddedUri: android.net.Uri? = null,
+    vararg extraPaths: String,
+) {
+    val repo = (LocalContext.current.applicationContext as MusicApplication).container.trackArtRepository
+    val loadKey = listOf(relativePath, version.toString(), embeddedUri?.toString().orEmpty(), *extraPaths).joinToString("|")
+    LaunchedEffect(loadKey) {
+        repo.requestLoad(relativePath, version, embeddedUri, force = false, *extraPaths)
+    }
+    TrackArtworkContent(
+        artState = repo.observeFor(relativePath, version, embeddedUri, *extraPaths),
+        modifier = modifier,
+        cornerSize = cornerSize,
+        fallbackLabel = fallbackLabel,
+    )
+}
+
+@Composable
+private fun TrackArtworkContent(
+    artState: kotlinx.coroutines.flow.StateFlow<TrackArtRepository.ArtLoadState>,
+    modifier: Modifier = Modifier,
+    cornerSize: Dp = 20.dp,
+    fallbackLabel: String? = null,
+) {
+    val state by artState.collectAsStateWithLifecycle()
 
     Box(
         modifier = modifier
@@ -45,20 +80,25 @@ fun TrackArtwork(
             .background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center,
     ) {
-        val bitmap = cover
-        if (bitmap != null) {
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-            )
-        } else {
-            Text(
-                text = track.title.firstOrNull()?.uppercase() ?: "♪",
-                style = MaterialTheme.typography.headlineMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        when (val current = state) {
+            is TrackArtRepository.ArtLoadState.Ready -> {
+                Image(
+                    bitmap = current.bitmap.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+
+            is TrackArtRepository.ArtLoadState.Missing,
+            is TrackArtRepository.ArtLoadState.Loading,
+            -> {
+                Text(
+                    text = fallbackLabel ?: "♪",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
         }
     }
 }

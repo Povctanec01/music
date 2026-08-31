@@ -4,8 +4,11 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import com.example.music.data.local.MusicScanner
+import com.example.music.data.local.SafStorage
 import com.example.music.data.preferences.AppPreferences
+import com.example.music.domain.art.TrackArtRepository
 import com.example.music.domain.model.Track
+import com.example.music.player.PlaybackController
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -13,6 +16,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -20,6 +24,9 @@ class LibraryRepository(
     private val context: Context,
     private val preferences: AppPreferences,
     private val scanner: MusicScanner,
+    private val storage: SafStorage,
+    private val trackArtRepository: TrackArtRepository,
+    private val playbackController: PlaybackController,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -67,6 +74,31 @@ class LibraryRepository(
         preferences.setFolderUri(uri.toString())
     }
 
+    suspend fun deleteTrack(track: Track): Boolean {
+        withContext(Dispatchers.Main.immediate) {
+            playbackController.releaseTrackIfPlaying(track.id)
+            playbackController.removeFromQueue(track.id)
+        }
+
+        return withContext(Dispatchers.IO) {
+            try {
+                val folder = preferences.folderUriOnce()?.let(Uri::parse) ?: return@withContext false
+                val deletedAudio = storage.deleteDocument(track.uri) ||
+                    storage.deleteRelativeFile(folder, track.relativePath)
+                storage.deleteSidecarsForAudio(folder, track.relativePath, track.uri)
+                if (!deletedAudio) return@withContext false
+
+                trackArtRepository.evictTrack(track)
+                _tracks.update { tracks -> tracks.filter { it.id != track.id } }
+                preferences.saveCachedTracks(folder.toString(), _tracks.value)
+                scan(showLoading = false)
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
     suspend fun scan(
         uri: Uri? = null,
         cachedByRelativePath: Map<String, Track> = emptyMap(),
@@ -85,6 +117,7 @@ class LibraryRepository(
             val result = withContext(Dispatchers.IO) { scanner.scan(folder, cachedMap) }
             _tracks.value = result
             preferences.saveCachedTracks(folderString, result)
+            trackArtRepository.reloadTracks(result)
         } catch (e: SecurityException) {
             _error.value = "Нет доступа к папке. Выберите её ещё раз."
             _tracks.value = emptyList()

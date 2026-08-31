@@ -12,7 +12,7 @@ class RecommendationEngine {
 
         val recommended = tracks
             .sortedByDescending { recommendationScore(it, behavior[it.id], favorites) }
-            .filter { recommendationScore(it, behavior[it.id], favorites) > 0.15f }
+            .filter { recommendationScore(it, behavior[it.id], favorites) > 1.2f }
             .take(12)
 
         val recent = tracks
@@ -130,18 +130,7 @@ class RecommendationEngine {
         behavior: TrackBehavior?,
         favorites: Set<String>,
     ): Float {
-        val item = behavior ?: TrackBehavior()
-        val favoriteBoost = if (track.id in favorites) 2.5f else 0f
-        val recencyBoost = if (item.lastPlayedAt > 0L) {
-            val daysSince = ((System.currentTimeMillis() - item.lastPlayedAt).coerceAtLeast(0L) / 86_400_000f)
-            1.5f / (1f + daysSince)
-        } else {
-            0f
-        }
-        val playScore = item.playCount * 0.45f
-        val completionScore = item.completionCount * 0.9f
-        val listenScore = (item.totalListenedMs / 60_000f).coerceAtMost(10f) * 0.18f
-        val skipPenalty = item.skipCount * 0.75f
-        return favoriteBoost + recencyBoost + playScore + completionScore + listenScore - skipPenalty
+        // Keep section ranking aligned with shuffle weighting.
+        return ShufflePicker.weight(track, behavior, favorites).toFloat()
     }
 }

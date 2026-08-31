@@ -8,7 +8,7 @@ export function buildRecommendationSections(
   if (!tracks.length) return []
 
   const recommended = tracks
-    .filter((track) => scoreTrack(track, behavior[track.id], favorites) > 0.1)
+    .filter((track) => scoreTrack(track, behavior[track.id], favorites) > 1.2)
     .sort((a, b) => scoreTrack(b, behavior[b.id], favorites) - scoreTrack(a, behavior[a.id], favorites))
     .slice(0, 12)
 
@@ -61,20 +61,58 @@ function scoreTrack(
   behavior: ListeningBehavior | undefined,
   favorites: Set<string>,
 ) {
-  if (!behavior && !favorites.has(track.id)) return 0
+  return shuffleWeight(track, behavior, favorites)
+}
+
+/** Weight for shuffle: frequent listens win more often; base > 0 keeps old tracks in play. */
+export function shuffleWeight(
+  track: MusicTrack,
+  behavior: ListeningBehavior | undefined,
+  favorites: Set<string>,
+) {
   const item = behavior ?? emptyBehavior()
-  const favoriteBoost = favorites.has(track.id) ? 2.5 : 0
+  const favoriteBoost = favorites.has(track.id) ? 4 : 0
+  const playScore = item.playCount * 2.2
+  const completionScore = item.completionCount * 3
+  const listenScore = Math.min(item.totalListenedMs / 60_000, 15) * 0.35
+  const skipPenalty = item.skipCount * 1.6
   const recencyBoost = item.lastPlayedAt
-    ? 1.5 / (1 + (Date.now() - item.lastPlayedAt) / 86_400_000)
+    ? 1.4 / (1 + (Date.now() - item.lastPlayedAt) / 86_400_000)
     : 0
-  return (
-    favoriteBoost +
-    item.playCount * 0.4 +
-    item.completionCount * 0.9 +
-    Math.min(item.totalListenedMs / 60_000, 8) * 0.15 +
-    recencyBoost -
-    item.skipCount * 0.7
-  )
+  return Math.max(0.2, 1 + favoriteBoost + playScore + completionScore + listenScore + recencyBoost - skipPenalty)
+}
+
+export function pickWeightedShuffle(
+  pool: MusicTrack[],
+  behavior: Record<string, ListeningBehavior>,
+  favorites: Set<string>,
+  excludeIds: string[] = [],
+): MusicTrack | null {
+  if (!pool.length) return null
+  const candidates = pool.filter((track) => !excludeIds.includes(track.id))
+  const list = candidates.length ? candidates : pool
+  if (list.length === 1) return list[0]
+
+  // ~20% exploration: rarely played / long-idle tracks ("old songs")
+  if (Math.random() < 0.2) {
+    const exploration = [...list]
+      .sort((a, b) => {
+        const playDiff = (behavior[a.id]?.playCount ?? 0) - (behavior[b.id]?.playCount ?? 0)
+        if (playDiff !== 0) return playDiff
+        return (behavior[a.id]?.lastPlayedAt ?? 0) - (behavior[b.id]?.lastPlayedAt ?? 0)
+      })
+      .slice(0, Math.max(1, Math.min(24, Math.floor(list.length / 3))))
+    return exploration[Math.floor(Math.random() * exploration.length)] ?? list[0]
+  }
+
+  const weights = list.map((track) => shuffleWeight(track, behavior[track.id], favorites))
+  const total = weights.reduce((sum, value) => sum + value, 0)
+  let ticket = Math.random() * total
+  for (let index = 0; index < list.length; index += 1) {
+    ticket -= weights[index]
+    if (ticket <= 0) return list[index]
+  }
+  return list[list.length - 1]
 }
 
 export function emptyBehavior(): ListeningBehavior {

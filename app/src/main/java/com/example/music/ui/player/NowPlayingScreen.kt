@@ -1,7 +1,5 @@
 package com.example.music.ui.player
 
-import android.graphics.Bitmap
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -43,7 +41,6 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -53,8 +50,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
@@ -64,7 +59,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
 import com.example.music.MusicApplication
 import com.example.music.domain.formatDuration
-import com.example.music.player.loadEmbeddedArtAsync
+import com.example.music.ui.components.TrackArtwork
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -79,14 +74,9 @@ fun NowPlayingScreen(onBack: () -> Unit) {
     val tracks by container.libraryRepository.tracks.collectAsStateWithLifecycle()
     val current = playback.currentTrack(tracks)
     val scope = rememberCoroutineScope()
-    var cover by remember { mutableStateOf<Bitmap?>(null) }
     var sliderActive by remember { mutableStateOf(false) }
     var sliderValue by remember { mutableFloatStateOf(0f) }
     var sleepMenu by remember { mutableStateOf(false) }
-
-    LaunchedEffect(current?.uri) {
-        cover = current?.uri?.let { loadEmbeddedArtAsync(context, it) }
-    }
 
     val duration = state.durationMs.coerceAtLeast(0L)
     val position = if (sliderActive) sliderValue.toLong() else state.positionMs
@@ -144,23 +134,23 @@ fun NowPlayingScreen(onBack: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Spacer(Modifier.height(12.dp))
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth(0.85f)
-                    .aspectRatio(1f)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
-                contentAlignment = Alignment.Center,
-            ) {
-                val bitmap = cover
-                if (bitmap != null) {
-                    Image(
-                        bitmap = bitmap.asImageBitmap(),
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                } else {
+            if (current != null) {
+                TrackArtwork(
+                    track = current,
+                    modifier = Modifier
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(1f),
+                    cornerSize = 16.dp,
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(1f)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center,
+                ) {
                     Text("♪", style = MaterialTheme.typography.displayLarge)
                 }
             }

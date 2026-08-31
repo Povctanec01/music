@@ -8,10 +8,12 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
 import shutil
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -24,6 +26,20 @@ AUDIO_EXT = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav"}
 CACHE_TTL_SEC = 30
 
 _cache: tuple[float, list[dict]] | None = None
+_prefetch_lock = threading.Lock()
+_prefetch_scheduled = False
+
+
+def sidecar_path_for_audio(file_path: Path) -> Path:
+    return file_path.with_suffix(".jpg")
+
+
+def sidecar_has_art(audio_path: Path) -> bool:
+    sidecar = sidecar_path_for_audio(audio_path)
+    try:
+        return sidecar.is_file() and sidecar.stat().st_size > 128
+    except OSError:
+        return False
 
 
 def list_library(force: bool = False) -> list[dict]:
@@ -46,9 +62,17 @@ def list_library(force: bool = False) -> list[dict]:
                     stat = path.stat()
                 except OSError:
                     continue
-                files.append({"path": rel, "size": stat.st_size, "mtime": int(stat.st_mtime)})
+                files.append(
+                    {
+                        "path": rel,
+                        "size": stat.st_size,
+                        "mtime": int(stat.st_mtime),
+                        "hasArt": sidecar_has_art(path),
+                    }
+                )
         files.sort(key=lambda item: item["path"].lower())
     _cache = (now, files)
+    schedule_art_prefetch(files)
     return files
 
 
@@ -91,35 +115,177 @@ def art_cache_paths(relative: str) -> tuple[Path, Path]:
 
 
 def extract_cover(file_path: Path) -> tuple[bytes, str] | None:
+    """Pull embedded cover art, then sidecar / sibling / YouTube thumbnail."""
+    embedded = extract_embedded_cover(file_path)
+    if embedded:
+        return embedded
+    sidecar = extract_sidecar_cover(file_path)
+    if sidecar:
+        return sidecar
+    sibling = extract_sibling_audio_cover(file_path)
+    if sibling:
+        return sibling
+    return extract_youtube_thumbnail(file_path)
+
+
+def extract_youtube_thumbnail(file_path: Path) -> tuple[bytes, str] | None:
+    stem = file_path.stem
+    matches = list(re.finditer(r"\[(?:-)?([A-Za-z0-9_-]{11})\]", stem))
+    if not matches:
+        loose = list(re.finditer(r"\[(-?[A-Za-z0-9_-]{6,})\]", stem))
+        if not loose:
+            return None
+        video_id = loose[-1].group(1).lstrip("-")
+    else:
+        video_id = matches[-1].group(1)
+    if not video_id:
+        return None
+    for url in (
+        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+    ):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "MusicServer/1.0"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                payload = response.read()
+                if len(payload) > 128:
+                    return payload, "image/jpeg"
+        except Exception:
+            continue
+    return None
+
+
+def extract_embedded_cover(file_path: Path) -> tuple[bytes, str] | None:
     try:
         from mutagen import File
-        from mutagen.id3 import APIC
-        from mutagen.mp4 import MP4Cover
+        from mutagen.flac import FLAC
+        from mutagen.id3 import APIC, ID3
+        from mutagen.mp4 import MP4, MP4Cover
     except ImportError:
         return None
 
-    audio = File(file_path)
+    # Direct ID3 read works best for many YouTube / MP3 downloads.
+    try:
+        id3 = ID3(str(file_path))
+        for frame in id3.getall("APIC"):
+            if getattr(frame, "data", None):
+                return frame.data, frame.mime or "image/jpeg"
+    except Exception:
+        pass
+
+    audio = File(str(file_path))
     if audio is None:
         return None
 
-    if hasattr(audio, "pictures") and audio.pictures:
+    pictures = getattr(audio, "pictures", None)
+    if pictures:
+        picture = pictures[0]
+        data = getattr(picture, "data", None)
+        if data:
+            return data, getattr(picture, "mime", None) or "image/jpeg"
+
+    if isinstance(audio, FLAC) and audio.pictures:
         picture = audio.pictures[0]
         return picture.data, picture.mime or "image/jpeg"
+
+    if isinstance(audio, MP4) and audio.tags is not None:
+        covers = audio.tags.get("covr")
+        if covers:
+            cover = covers[0]
+            mime = "image/png" if getattr(cover, "imageformat", None) == MP4Cover.FORMAT_PNG else "image/jpeg"
+            return bytes(cover), mime
 
     tags = getattr(audio, "tags", None)
     if not tags:
         return None
 
-    for tag in tags.values():
-        if isinstance(tag, APIC):
-            return tag.data, tag.mime or "image/jpeg"
+    values = []
+    try:
+        values = list(tags.values())
+    except Exception:
+        values = []
+
+    for tag in values:
+        frames = tag if isinstance(tag, list) else [tag]
+        for frame in frames:
+            if isinstance(frame, APIC) and getattr(frame, "data", None):
+                return frame.data, frame.mime or "image/jpeg"
+            if isinstance(frame, MP4Cover):
+                mime = "image/png" if frame.imageformat == MP4Cover.FORMAT_PNG else "image/jpeg"
+                return bytes(frame), mime
 
     if hasattr(tags, "getall"):
-        for cover in tags.getall("covr"):
-            if isinstance(cover, MP4Cover):
-                return bytes(cover), "image/jpeg"
+        try:
+            for cover in tags.getall("covr"):
+                if isinstance(cover, MP4Cover):
+                    mime = "image/png" if cover.imageformat == MP4Cover.FORMAT_PNG else "image/jpeg"
+                    return bytes(cover), mime
+        except Exception:
+            pass
 
     return None
+
+
+def extract_sidecar_cover(file_path: Path) -> tuple[bytes, str] | None:
+    parent = file_path.parent
+    stem = file_path.stem
+    candidates = [parent / f"{stem}{ext}" for ext in (".jpg", ".jpeg", ".png", ".webp")]
+    candidates.extend(parent / name for name in ("cover.jpg", "cover.png", "folder.jpg", "Folder.jpg", "AlbumArt.jpg"))
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            payload = candidate.read_bytes()
+        except OSError:
+            continue
+        if not payload:
+            continue
+        mime = mimetypes.guess_type(candidate.name)[0] or "image/jpeg"
+        return payload, mime
+    return None
+
+
+def normalize_track_stem(stem: str) -> str:
+    # Drop trailing YouTube-style ids: "Title [TOoC7aXkpMs]"
+    cleaned = re.sub(r"\s*\[[A-Za-z0-9_-]{6,}\]\s*$", "", stem).strip()
+    return cleaned.casefold()
+
+
+def extract_sibling_audio_cover(file_path: Path) -> tuple[bytes, str] | None:
+    """YouTube .m4a often has no cover; reuse art from a nearby .mp3 of the same title."""
+    base = normalize_track_stem(file_path.stem)
+    if not base:
+        return None
+    try:
+        siblings = list(file_path.parent.iterdir())
+    except OSError:
+        return None
+    for candidate in siblings:
+        if candidate == file_path or not candidate.is_file():
+            continue
+        if candidate.suffix.lower() not in AUDIO_EXT:
+            continue
+        other = normalize_track_stem(candidate.stem)
+        if not other:
+            continue
+        if other == base or other.startswith(base) or base.startswith(other):
+            art = extract_embedded_cover(candidate)
+            if art:
+                return art
+            art = extract_sidecar_cover(candidate)
+            if art:
+                return art
+    return None
+
+
+def clear_cached_art(relative: str) -> None:
+    image_path, meta_path = art_cache_paths(relative)
+    for path in (image_path, meta_path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def load_cached_art(relative: str, source_mtime: int) -> tuple[bytes, str] | None:
@@ -143,6 +309,128 @@ def store_cached_art(relative: str, source_mtime: int, payload: bytes, mime: str
     meta_path.write_text(json.dumps({"mtime": source_mtime, "mime": mime}), encoding="utf-8")
 
 
+def store_sidecar_art(audio_path: Path, payload: bytes) -> None:
+    """Persist cover next to the audio file so sync can ship it to phones."""
+    if len(payload) <= 128:
+        return
+    sidecar = sidecar_path_for_audio(audio_path)
+    sidecar.write_bytes(payload)
+
+
+def load_stored_sidecar_art(target: Path) -> tuple[bytes, str] | None:
+    """Return on-disk `{stem}.jpg` saved by the server prefetch step."""
+    sidecar = sidecar_path_for_audio(target)
+    if not sidecar.is_file():
+        return None
+    try:
+        if sidecar.stat().st_size <= 128:
+            return None
+        payload = sidecar.read_bytes()
+        if len(payload) <= 128:
+            return None
+        mime = mimetypes.guess_type(sidecar.name)[0] or "image/jpeg"
+        return payload, mime
+    except OSError:
+        return None
+
+
+def ensure_art_for_relative(relative: str) -> bool:
+    return resolve_art(relative) is not None
+
+
+def prefetch_art_for_paths(paths: list[str], force: bool = False, sync_limit: int = 1) -> dict:
+    """Quick art check: sync only a few tracks, schedule the rest in background."""
+    ready = 0
+    missing = 0
+    total = 0
+    pending_paths: list[str] = []
+    for relative in paths:
+        relative = (relative or "").strip()
+        if not relative:
+            continue
+        total += 1
+        target = safe_file(relative)
+        if not force and target is not None and sidecar_has_art(target):
+            ready += 1
+            continue
+        pending_paths.append(relative)
+
+    synced = 0
+    for relative in pending_paths[:sync_limit]:
+        if ensure_art_for_relative(relative):
+            ready += 1
+        else:
+            missing += 1
+        synced += 1
+
+    tail = pending_paths[synced:]
+    if tail:
+        schedule_art_prefetch([{"path": path} for path in tail], force=force)
+        missing += len(tail)
+
+    return {
+        "total": total,
+        "ready": ready,
+        "missing": missing,
+        "pending": len(tail),
+        "status": "done" if not tail else "prefetch_scheduled",
+    }
+
+
+def schedule_art_prefetch(files: list[dict], force: bool = False) -> None:
+    """Background: download missing covers on the server (YouTube / embedded)."""
+    global _prefetch_scheduled
+
+    def worker() -> None:
+        global _prefetch_scheduled
+        try:
+            for entry in files:
+                relative = entry.get("path") or ""
+                if not relative:
+                    continue
+                if not force and entry.get("hasArt"):
+                    continue
+                ensure_art_for_relative(relative)
+        finally:
+            with _prefetch_lock:
+                _prefetch_scheduled = False
+
+    with _prefetch_lock:
+        if _prefetch_scheduled:
+            return
+        _prefetch_scheduled = True
+    threading.Thread(target=worker, name="art-prefetch", daemon=True).start()
+
+
+def clear_sidecar_art(relative: str) -> None:
+    target = safe_file(relative)
+    if target is None:
+        return
+    sidecar = sidecar_path_for_audio(target)
+    try:
+        sidecar.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def refresh_library_art(force_sidecar: bool = True) -> dict:
+    files = list_library(force=True)
+    refreshed = 0
+    missing = 0
+    for entry in files:
+        relative = entry["path"]
+        if force_sidecar:
+            clear_sidecar_art(relative)
+            clear_cached_art(relative)
+        if ensure_art_for_relative(relative):
+            refreshed += 1
+            entry["hasArt"] = True
+        else:
+            missing += 1
+            entry["hasArt"] = False
+    return {"total": len(files), "refreshed": refreshed, "missing": missing}
+
+
 def resolve_art(relative: str) -> tuple[bytes, str] | None:
     target = safe_file(relative)
     if target is None:
@@ -152,8 +440,16 @@ def resolve_art(relative: str) -> tuple[bytes, str] | None:
     except OSError:
         return None
 
+    sidecar = load_stored_sidecar_art(target)
+    if sidecar:
+        payload, mime = sidecar
+        store_cached_art(relative, source_mtime, payload, mime)
+        return payload, mime
+
     cached = load_cached_art(relative, source_mtime)
     if cached:
+        payload, mime = cached
+        store_sidecar_art(target, payload)
         return cached
 
     extracted = extract_cover(target)
@@ -162,6 +458,7 @@ def resolve_art(relative: str) -> tuple[bytes, str] | None:
 
     payload, mime = extracted
     store_cached_art(relative, source_mtime, payload, mime)
+    store_sidecar_art(target, payload)
     return payload, mime
 
 
@@ -289,6 +586,29 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/files/"):
             self._send_file(path[len("/files/") :])
             return
+        if path == "/api/art/refresh":
+            try:
+                self._json(200, refresh_library_art(force_sidecar=True))
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+            return
+        if path == "/api/art/prefetch":
+            try:
+                files = list_library(force=True)
+                schedule_art_prefetch(files, force=False)
+                ready = sum(1 for item in files if item.get("hasArt"))
+                self._json(
+                    200,
+                    {
+                        "total": len(files),
+                        "ready": ready,
+                        "pending": len(files) - ready,
+                        "status": "prefetch_scheduled",
+                    },
+                )
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+            return
         if path.startswith("/api/art/"):
             self._send_art(path[len("/api/art/") :])
             return
@@ -299,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self._send_cors_headers()
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -316,7 +636,53 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/upload":
             self._upload(parsed.query)
             return
+        if parsed.path == "/api/art/prefetch":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode("utf-8") or "{}")
+                paths = body.get("paths") or []
+                force = bool(body.get("force"))
+                if paths:
+                    self._json(200, prefetch_art_for_paths(paths, force=force))
+                else:
+                    files = list_library(force=True)
+                    schedule_art_prefetch(files, force=force)
+                    ready = sum(1 for item in files if item.get("hasArt"))
+                    self._json(
+                        200,
+                        {
+                            "total": len(files),
+                            "ready": ready,
+                            "pending": len(files) - ready,
+                            "status": "prefetch_scheduled",
+                        },
+                    )
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+            return
         self._json(404, {"error": "not found"})
+
+    def do_DELETE(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/file/"):
+            self._delete_file(parsed.path[len("/api/file/") :])
+            return
+        self._json(404, {"error": "not found"})
+
+    def _delete_file(self, relative: str) -> None:
+        target = safe_file(relative)
+        if target is None:
+            self._json(404, {"error": "file not found"})
+            return
+        try:
+            target.unlink()
+        except OSError as exc:
+            self._json(500, {"error": str(exc)})
+            return
+        clear_cached_art(target.relative_to(MUSIC_DIR).as_posix())
+        invalidate_cache()
+        self._json(200, {"deleted": target.relative_to(MUSIC_DIR).as_posix()})
 
     def _json(self, code: int, payload: dict, body: bool = True) -> None:
         data = json.dumps(payload).encode("utf-8")
@@ -490,6 +856,7 @@ class Handler(BaseHTTPRequestHandler):
                     "size": destination.stat().st_size,
                 }
             )
+            ensure_art_for_relative(destination.relative_to(MUSIC_DIR).as_posix())
 
         if not uploaded:
             self._json(400, {"error": "no valid audio files uploaded"})
@@ -502,8 +869,13 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     MUSIC_DIR.mkdir(parents=True, exist_ok=True)
     ART_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Music API on {HOST}:{PORT}, dir={MUSIC_DIR}")
+    try:
+        initial = list_library(force=True)
+        print(f"Library: {len(initial)} tracks, prefetching covers on server…")
+    except Exception as exc:
+        print(f"Startup library scan failed: {exc}")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

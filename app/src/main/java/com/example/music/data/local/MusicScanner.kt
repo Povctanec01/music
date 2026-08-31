@@ -1,10 +1,10 @@
 package com.example.music.data.local
 
 import android.content.Context
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.DocumentsContract
 import com.example.music.domain.AudioFormats
+import com.example.music.domain.metadata.TrackMetadataReader
 import com.example.music.domain.model.Track
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -82,12 +82,12 @@ class MusicScanner(private val context: Context) {
         lastModified: Long,
         cachedTracksByRelativePath: Map<String, Track>,
     ): Track {
-        val fallbackTitle = displayName.substringBeforeLast('.')
-
-        // Пропускаем MediaMetadataRetriever, если файл не изменился с прошлого скана.
+        // Пропускаем повторное чтение, если файл не изменился и метаданные уже полные.
         val cacheKey = relativePath.replace('\\', '/').lowercase()
         val cached = cachedTracksByRelativePath[cacheKey]
-        if (cached != null && cached.size == size && cached.addedAt == lastModified) {
+        if (cached != null && cached.size == size && cached.addedAt == lastModified &&
+            !TrackMetadataReader.needsMetadataRefresh(cached, displayName)
+        ) {
             return cached.copy(
                 id = uri.toString(),
                 uri = uri,
@@ -96,56 +96,21 @@ class MusicScanner(private val context: Context) {
             )
         }
 
-        val retriever = MediaMetadataRetriever()
-        return try {
-            retriever.setDataSource(context, uri)
-            val title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
-                ?.takeIf { it.isNotBlank() } ?: fallbackTitle
-            val artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST).orEmpty()
-            val album = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM).orEmpty()
-            val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                ?.toLongOrNull() ?: 0L
-            val year = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_YEAR)?.toIntOrNull()
-            val trackNumber = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER)
-                ?.substringBefore('/')
-                ?.trim()
-                ?.toIntOrNull()
-            Track(
-                id = uri.toString(),
-                uri = uri,
-                displayName = displayName,
-                relativePath = relativePath.replace('\\', '/'),
-                title = title,
-                artist = artist,
-                album = album,
-                durationMs = duration,
-                size = size,
-                year = year,
-                trackNumber = trackNumber,
-                addedAt = lastModified,
-                mimeType = mime.ifBlank { AudioFormats.mimeForFileName(displayName) },
-            )
-        } catch (_: Exception) {
-            Track(
-                id = uri.toString(),
-                uri = uri,
-                displayName = displayName,
-                relativePath = relativePath.replace('\\', '/'),
-                title = fallbackTitle,
-                artist = "",
-                album = "",
-                durationMs = 0L,
-                size = size,
-                year = null,
-                trackNumber = null,
-                addedAt = lastModified,
-                mimeType = mime.ifBlank { AudioFormats.mimeForFileName(displayName) },
-            )
-        } finally {
-            try {
-                retriever.release()
-            } catch (_: Exception) {
-            }
-        }
+        val metadata = TrackMetadataReader.read(context, uri, displayName)
+        return Track(
+            id = uri.toString(),
+            uri = uri,
+            displayName = displayName,
+            relativePath = relativePath.replace('\\', '/'),
+            title = metadata.title,
+            artist = metadata.artist,
+            album = metadata.album,
+            durationMs = metadata.durationMs,
+            size = size,
+            year = metadata.year,
+            trackNumber = metadata.trackNumber,
+            addedAt = lastModified,
+            mimeType = mime.ifBlank { AudioFormats.mimeForFileName(displayName) },
+        )
     }
 }

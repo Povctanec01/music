@@ -7,6 +7,9 @@ import com.example.music.data.local.SafStorage
 import com.example.music.data.preferences.AppPreferences
 import com.example.music.data.remote.NetworkMonitor
 import com.example.music.data.remote.ServerClient
+import com.example.music.domain.art.SidecarArtSync
+import com.example.music.domain.art.ServerArtIndex
+import com.example.music.domain.art.TrackArtRepository
 import com.example.music.domain.model.ConnectionChannel
 import com.example.music.domain.model.DownloadStatus
 import com.example.music.domain.model.DownloadTask
@@ -23,6 +26,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.FileOutputStream
 import java.io.IOException
 
@@ -32,6 +36,8 @@ class DownloadManager(
     private val server: ServerClient,
     private val storage: SafStorage,
     private val network: NetworkMonitor,
+    private val sidecarArtSync: SidecarArtSync,
+    private val trackArtRepository: TrackArtRepository,
     private val onFinished: suspend () -> Unit,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -58,7 +64,9 @@ class DownloadManager(
     private var job: Job? = null
 
     fun enqueue(files: List<RemoteFile>) {
-        _tasks.value = files.map { DownloadTask(path = it.path, size = it.size) }
+        _tasks.value = files.map {
+            DownloadTask(path = it.path, size = it.size, mtime = it.mtime, hasArt = it.hasArt)
+        }
         _lastError.value = null
         resume()
     }
@@ -109,6 +117,7 @@ class DownloadManager(
 
         startForegroundService()
         _running.value = true
+        refreshArtContext(endpoint)
         _statusMessage.value = channelLabel(endpoint.channel)
 
         try {
@@ -179,6 +188,7 @@ class DownloadManager(
             updateTask(task.path) {
                 it.copy(bytesDownloaded = existing, status = DownloadStatus.DONE)
             }
+            downloadSidecar(folder, endpoint.baseUrl, task, file.uri)
             return
         }
 
@@ -186,6 +196,7 @@ class DownloadManager(
         call.execute().use { response ->
             if (response.code == 416) {
                 updateTask(task.path) { it.copy(bytesDownloaded = task.size, status = DownloadStatus.DONE) }
+                downloadSidecar(folder, endpoint.baseUrl, task, file.uri)
                 return
             }
             if (!response.isSuccessful && response.code != 206) {
@@ -226,6 +237,55 @@ class DownloadManager(
                 }
             }
         }
+        downloadSidecar(folder, endpoint.baseUrl, task, file.uri)
+    }
+
+    private suspend fun downloadSidecar(
+        folder: Uri,
+        baseUrl: String,
+        task: DownloadTask,
+        audioUri: Uri,
+    ) {
+        val basename = task.path.substringAfterLast('/')
+        val extraPaths = arrayOf(basename, basename.substringBeforeLast('.'))
+        if (!task.hasArt) {
+            runCatching { server.prefetchArtPaths(baseUrl, listOf(task.path), force = true) }
+        }
+
+        var bytes: ByteArray? = null
+        for (attempt in 0 until SIDECAR_RETRY_COUNT) {
+            if (attempt > 0) delay(SIDECAR_RETRY_DELAY_MS * attempt)
+            bytes = sidecarArtSync.downloadAndSave(
+                treeUri = folder,
+                serverBaseUrl = baseUrl,
+                audioRelativePath = task.path,
+                mtime = task.mtime,
+                audioUri = audioUri,
+                serverIndex = trackArtRepository.serverIndex,
+                extraPaths = extraPaths,
+                force = true,
+            )
+            if (bytes != null) break
+        }
+
+        bytes?.takeIf { it.isNotEmpty() }?.let {
+            trackArtRepository.onSidecarSaved(
+                relativePath = task.path,
+                version = task.mtime,
+                contentUri = audioUri,
+                bytes = it,
+            )
+        }
+        trackArtRepository.notifySidecarFromDisk(task.path, task.mtime, audioUri)
+    }
+
+    private suspend fun refreshArtContext(endpoint: ServerEndpoint) {
+        val index = withTimeoutOrNull(15_000L) {
+            runCatching {
+                ServerArtIndex.fromLibrary(server.library(endpoint.baseUrl))
+            }.getOrDefault(trackArtRepository.serverIndex)
+        } ?: trackArtRepository.serverIndex
+        trackArtRepository.updateServerContext(endpoint.baseUrl, index)
     }
 
     private fun startForegroundService() {
@@ -257,5 +317,7 @@ class DownloadManager(
 
     companion object {
         private const val DEFAULT_BUFFER = 64 * 1024
+        private const val SIDECAR_RETRY_COUNT = 6
+        private const val SIDECAR_RETRY_DELAY_MS = 1000L
     }
 }
