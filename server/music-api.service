@@ -8,10 +8,22 @@ Environment=MUSIC_DIR=/srv/music
 Environment=WEB_DIR=/opt/music-server/web
 Environment=MUSIC_PORT=8080
 Environment=MUSIC_HOST=0.0.0.0
+Environment=MUSIC_API_TOKEN_FILE=/etc/music-api/token
+Environment=ART_CACHE_DIR=/var/cache/music-art
+EnvironmentFile=-/etc/music-api/environment
 ExecStart=/usr/bin/python3 /opt/music-server/server.py
 Restart=always
 RestartSec=2
-User=root
+User=music
+Group=music
+CacheDirectory=music-art
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/music /var/cache/music-art
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target

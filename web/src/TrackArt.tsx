@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import type { MusicTrack } from './types'
 
 type Props = {
@@ -8,14 +8,14 @@ type Props = {
 }
 
 export function TrackArt(props: Props) {
+  return <TrackArtImage key={`${props.track.id}|${props.track.artUrl}|${props.track.youtubeArtUrl}`} {...props} />
+}
+
+function TrackArtImage(props: Props) {
   const { track, className, fallback } = props
   const sources = [track.youtubeArtUrl, track.artUrl].filter(Boolean) as string[]
   const [sourceIndex, setSourceIndex] = useState(0)
   const label = (fallback ?? track.title[0] ?? '♪').toUpperCase()
-
-  useEffect(() => {
-    setSourceIndex(0)
-  }, [track.id, track.artUrl, track.youtubeArtUrl])
 
   const src = sources[sourceIndex]
   if (src) {

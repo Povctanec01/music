@@ -39,6 +39,7 @@ fun TrackArtwork(
         modifier = modifier,
         cornerSize = cornerSize,
         fallbackLabel = fallbackLabel ?: track.title.firstOrNull()?.uppercase(),
+        onReload = { repo.requestLoadForTrack(track) },
     )
 }
 
@@ -62,6 +63,7 @@ fun TrackArtworkFromPath(
         modifier = modifier,
         cornerSize = cornerSize,
         fallbackLabel = fallbackLabel,
+        onReload = { repo.requestLoad(relativePath, version, embeddedUri, force = false, *extraPaths) },
     )
 }
 
@@ -71,8 +73,12 @@ private fun TrackArtworkContent(
     modifier: Modifier = Modifier,
     cornerSize: Dp = 20.dp,
     fallbackLabel: String? = null,
+    onReload: () -> Unit,
 ) {
     val state by artState.collectAsStateWithLifecycle()
+    LaunchedEffect(state) {
+        if (state is TrackArtRepository.ArtLoadState.Evicted) onReload()
+    }
 
     Box(
         modifier = modifier
@@ -92,6 +98,7 @@ private fun TrackArtworkContent(
 
             is TrackArtRepository.ArtLoadState.Missing,
             is TrackArtRepository.ArtLoadState.Loading,
+            is TrackArtRepository.ArtLoadState.Evicted,
             -> {
                 Text(
                     text = fallbackLabel ?: "♪",

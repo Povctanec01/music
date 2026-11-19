@@ -42,8 +42,9 @@ export function createLoudnessController(audio: HTMLAudioElement): LoudnessContr
   const timeData = new Float32Array(analyser.fftSize)
 
   source.connect(autoGain)
-  autoGain.connect(analyser)
-  analyser.connect(compressor)
+  // Measure the input, before applying gain, to avoid a feedback loop.
+  source.connect(analyser)
+  autoGain.connect(compressor)
   compressor.connect(masterGain)
   masterGain.connect(ctx.destination)
 
@@ -59,8 +60,8 @@ export function createLoudnessController(audio: HTMLAudioElement): LoudnessContr
 
   const tick = () => {
     raf = requestAnimationFrame(tick)
-    if (!enabled || audio.paused) return
     if (ctx.state === 'suspended') void ctx.resume()
+    if (!enabled || audio.paused) return
 
     analyser.getFloatTimeDomainData(timeData)
     let sum = 0
@@ -88,6 +89,7 @@ export function createLoudnessController(audio: HTMLAudioElement): LoudnessContr
   return {
     setEnabled(next) {
       enabled = next
+      compressor.ratio.setTargetAtTime(next ? 3 : 1, ctx.currentTime, 0.05)
       if (!next) {
         currentGain = 1
         autoGain.gain.setTargetAtTime(1, ctx.currentTime, 0.05)
@@ -101,7 +103,7 @@ export function createLoudnessController(audio: HTMLAudioElement): LoudnessContr
       currentGain = 1
       sampleCount = 0
       rmsAccum = 0
-      autoGain.gain.setTargetAtTime(enabled ? 1 : 1, ctx.currentTime, 0.01)
+      autoGain.gain.setTargetAtTime(1, ctx.currentTime, 0.01)
       if (ctx.state === 'suspended') void ctx.resume()
     },
     dispose() {

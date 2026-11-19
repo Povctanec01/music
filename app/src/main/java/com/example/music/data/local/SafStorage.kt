@@ -2,14 +2,100 @@ package com.example.music.data.local
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import com.example.music.domain.art.TrackArtCache
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import com.example.music.domain.AudioFormats
 import com.example.music.domain.art.TrackSidecarArt
 import java.io.IOException
+import java.io.File
+import java.util.UUID
+import com.example.music.data.download.DownloadFiles
 
 class SafStorage(private val context: Context) {
+
+    /** Providers without rename support fail safely instead of overwriting the old audio. */
+    fun replaceVerified(treeUri: Uri, relativePath: String, source: File, checksum: String?, canContinue: () -> Boolean = { true }): Uri {
+        DownloadFiles.verify(source, source.length(), checksum)
+        val parts = splitRelativePath(relativePath)
+        val parent = directory(treeUri, parts.dropLast(1), create = true)
+        val name = parts.last()
+        val temp = parent.createFile("application/octet-stream", ".music-stage-${UUID.randomUUID()}")
+            ?: throw IOException("Не удалось создать временный файл")
+        var backup: DocumentFile? = null
+        var committed = false
+        try {
+            context.contentResolver.openOutputStream(temp.uri, "rwt")?.use { output ->
+                source.inputStream().use { input ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        if (!canContinue()) throw IOException("Замена приостановлена или отменена")
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                    }
+                }
+            } ?: throw IOException("Нет доступа к временному файлу")
+            val actual = context.contentResolver.openInputStream(temp.uri)?.use { input ->
+                val digest = java.security.MessageDigest.getInstance("SHA-256")
+                val buffer = ByteArray(1024 * 1024)
+                var size = 0L
+                while (true) {
+                    if (!canContinue()) throw IOException("Замена приостановлена или отменена")
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    digest.update(buffer, 0, count); size += count
+                }
+                size to digest.digest().joinToString("") { "%02x".format(it) }
+            } ?: throw IOException("Не удалось проверить временный файл")
+            if (actual.first != source.length() || (!checksum.isNullOrBlank() && !actual.second.equals(checksum, true))) {
+                throw IOException("Проверка записанного файла не пройдена")
+            }
+            if (!canContinue()) throw IOException("Замена приостановлена или отменена")
+            parent.findFileIgnoreCase(name)?.let { existing ->
+                if (!existing.isFile || !existing.renameTo(".music-backup-${UUID.randomUUID()}")) {
+                    throw IOException("Папка не поддерживает безопасную замену файлов")
+                }
+                backup = existing
+            }
+            if (!temp.renameTo(name)) throw IOException("Не удалось завершить безопасную замену")
+            committed = true
+            runCatching { backup?.delete() }
+            return temp.uri
+        } finally {
+            if (!committed) {
+                temp.delete()
+                if (backup?.renameTo(name) == false) throw IOException("Исходный файл сохранён под резервным именем в выбранной папке")
+            }
+        }
+    }
+
+    fun moveToTrash(treeUri: Uri, relativePath: String): String {
+        val parts = splitRelativePath(relativePath)
+        val parent = directory(treeUri, parts.dropLast(1), create = false)
+        val file = parent.findFileIgnoreCase(parts.last()) ?: throw IOException("Файл не найден")
+        val hidden = ".music-trash-${UUID.randomUUID()}"
+        if (!file.renameTo(hidden)) throw IOException("Папка не поддерживает перемещение в корзину")
+        return (parts.dropLast(1) + hidden).joinToString("/")
+    }
+
+    fun restoreFromTrash(treeUri: Uri, originalPath: String, hiddenPath: String) {
+        val parts = splitRelativePath(originalPath)
+        val hiddenParts = splitRelativePath(hiddenPath)
+        require(parts.dropLast(1) == hiddenParts.dropLast(1))
+        val parent = directory(treeUri, parts.dropLast(1), create = false)
+        if (parent.findFileIgnoreCase(parts.last()) != null) throw IOException("Файл с таким именем уже существует")
+        val hidden = parent.findFileIgnoreCase(hiddenParts.last()) ?: throw IOException("Файл в корзине не найден")
+        if (!hidden.renameTo(parts.last())) throw IOException("Не удалось восстановить файл")
+    }
+
+    private fun directory(treeUri: Uri, parts: List<String>, create: Boolean): DocumentFile {
+        var current = root(treeUri)
+        for (name in parts) current = current.findFileIgnoreCase(name)?.takeIf { it.isDirectory }
+            ?: (if (create) current.createDirectory(name) else null)
+            ?: throw IOException("Папка не найдена: $name")
+        return current
+    }
 
     fun root(treeUri: Uri): DocumentFile =
         DocumentFile.fromTreeUri(context, treeUri)
@@ -62,7 +148,7 @@ class SafStorage(private val context: Context) {
         val sidecar = parent.findFileIgnoreCase("$stem.jpg") ?: return null
         if (!sidecar.isFile) return null
         val bytes = context.contentResolver.openInputStream(sidecar.uri)?.use { it.readBytes() } ?: return null
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        return TrackArtCache.decode(bytes)
             ?.takeIf { it.width > 1 && it.height > 1 }
     }
 
@@ -75,7 +161,7 @@ class SafStorage(private val context: Context) {
     fun readSidecarBitmap(treeUri: Uri, audioRelativePath: String): Bitmap? {
         val sidecarPath = TrackSidecarArt.primarySidecarRelativePath(audioRelativePath)
         val bytes = readBytes(treeUri, sidecarPath) ?: return null
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        return TrackArtCache.decode(bytes)
             ?.takeIf { it.width > 1 && it.height > 1 }
     }
 

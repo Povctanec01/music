@@ -46,23 +46,11 @@ export function WaveformTrimEditor(props: Props) {
   const [loadingWave, setLoadingWave] = useState(true)
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
-  const [startInput, setStartInput] = useState(formatTimePrecise(startSec))
-  const [endInput, setEndInput] = useState(formatTimePrecise(endSec))
-
-  useEffect(() => {
-    setStartInput(formatTimePrecise(startSec))
-  }, [startSec])
-
-  useEffect(() => {
-    setEndInput(formatTimePrecise(endSec))
-  }, [endSec])
+  const [startInput, setStartInput] = useState<string | null>(null)
+  const [endInput, setEndInput] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
-    setLoadingWave(true)
-    setPeaks([])
-    peaksRef.current = []
-
     void (async () => {
       try {
         const response = await fetch(audioUrl)
@@ -288,22 +276,22 @@ export function WaveformTrimEditor(props: Props) {
     if (audio.currentTime < startSec || audio.currentTime >= endSec) {
       audio.currentTime = startSec
     }
-    void audio.play()
+    void audio.play().catch(() => setPlaying(false))
   }
 
   function commitStartInput() {
-    const parsed = parseTimePrecise(startInput)
+    const parsed = parseTimePrecise(startInput ?? formatTimePrecise(startSec))
+    setStartInput(null)
     if (parsed == null) {
-      setStartInput(formatTimePrecise(startSec))
       return
     }
     onStartChange(Math.min(parsed, endSec - 0.05))
   }
 
   function commitEndInput() {
-    const parsed = parseTimePrecise(endInput)
+    const parsed = parseTimePrecise(endInput ?? formatTimePrecise(endSec))
+    setEndInput(null)
     if (parsed == null) {
-      setEndInput(formatTimePrecise(endSec))
       return
     }
     onEndChange(Math.max(parsed, startSec + 0.05))
@@ -362,7 +350,7 @@ export function WaveformTrimEditor(props: Props) {
           <div className="trim-time-fields">
             <label className="trim-time-field">
               <input
-                value={startInput}
+                value={startInput ?? formatTimePrecise(startSec)}
                 onChange={(event) => setStartInput(event.target.value)}
                 onBlur={commitStartInput}
                 onKeyDown={(event) => event.key === 'Enter' && commitStartInput()}
@@ -371,7 +359,7 @@ export function WaveformTrimEditor(props: Props) {
             </label>
             <label className="trim-time-field">
               <input
-                value={endInput}
+                value={endInput ?? formatTimePrecise(endSec)}
                 onChange={(event) => setEndInput(event.target.value)}
                 onBlur={commitEndInput}
                 onKeyDown={(event) => event.key === 'Enter' && commitEndInput()}

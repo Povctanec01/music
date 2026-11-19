@@ -16,7 +16,15 @@ import com.example.music.domain.model.DownloadStatus
 import com.example.music.domain.model.DownloadTask
 import com.example.music.domain.model.RemoteFile
 import com.example.music.domain.model.ServerEndpoint
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.combine
+import com.example.music.data.local.DownloadSnapshot
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -24,12 +32,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicReference
+import okhttp3.Call
 
 class DownloadManager(
     private val context: Context,
@@ -43,6 +54,7 @@ class DownloadManager(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
+    private val enqueueMutex = Mutex()
 
     private val _tasks = MutableStateFlow<List<DownloadTask>>(emptyList())
     val tasks: StateFlow<List<DownloadTask>> = _tasks.asStateFlow()
@@ -62,14 +74,87 @@ class DownloadManager(
     private val _endpoint = MutableStateFlow<ServerEndpoint?>(null)
     val endpoint: StateFlow<ServerEndpoint?> = _endpoint.asStateFlow()
 
-    private var job: Job? = null
+    @Volatile private var job: Job? = null
+    private val activeCall = AtomicReference<Call?>(null)
+
+    private val restored = CompletableDeferred<Unit>()
+    suspend fun awaitRestored() = restored.await()
+    @Volatile private var queueFolder: String? = null
+
+    init {
+        scope.launch {
+            try {
+                preferences.database.downloadSnapshot()?.let { snapshot ->
+                    queueFolder = snapshot.folder
+                    _tasks.value = snapshot.tasks.map {
+                        if (it.status != DownloadStatus.DONE)
+                            it.copy(status = DownloadStatus.PAUSED) else it
+                    }
+                    _paused.value = _tasks.value.any { it.status == DownloadStatus.PAUSED }
+                    if (_paused.value) _statusMessage.value = "Очередь восстановлена. Нажмите «Продолжить»."
+                }
+            } catch (error: Exception) {
+                _lastError.value = error.message ?: "Не удалось восстановить очередь"
+            }
+            combine(_tasks, _paused) { _, _ -> Unit }
+                .collect {
+                    try { preferences.database.saveDownloads(DownloadSnapshot(queueFolder, _tasks.value, _paused.value)) }
+                    catch (error: Exception) { _lastError.value = error.message; _paused.value = true }
+                    finally { if (!restored.isCompleted) restored.complete(Unit) }
+                }
+        }
+    }
 
     fun enqueue(files: List<RemoteFile>) {
-        _tasks.value = files.map {
-            DownloadTask(path = it.path, size = it.size, mtime = it.mtime, hasArt = it.hasArt)
+        scope.launch {
+          enqueueMutex.withLock {
+            try {
+                restored.await()
+                if (files.isEmpty()) return@launch
+                val folder = preferences.folderUriOnce()
+                val paths = _tasks.value.filter { it.status != DownloadStatus.DONE }.map { it.path } + files.map { it.path }
+                if (paths.distinct().groupBy { it.lowercase() }.any { it.value.size > 1 }) {
+                    _lastError.value = "Есть пути, отличающиеся только регистром. Переименуйте их на сервере перед загрузкой."
+                    return@launch
+                }
+                if (_tasks.value.any { it.status != DownloadStatus.DONE } && queueFolder != folder) {
+                    _lastError.value = "Сначала завершите очередь для предыдущей папки"
+                    return@launch
+                }
+                // Finish the previous worker before replacing a task with a new version.
+                // Otherwise its final progress/DONE update could overwrite the new task.
+                val previousJob = job
+                previousJob?.cancel()
+                activeCall.getAndSet(null)?.cancel()
+                previousJob?.cancelAndJoin()
+                _tasks.update { current -> current.map {
+                    if (it.status == DownloadStatus.RUNNING) it.copy(status = DownloadStatus.PAUSED) else it
+                } }
+                queueFolder = folder
+                val additions = files.map {
+                    DownloadTask(path = it.path, size = it.size, mtime = it.mtime, hasArt = it.hasArt, sha256 = it.sha256, version = it.version)
+                }
+                _tasks.update { current ->
+                    val pending = current.filter { it.status != DownloadStatus.DONE }.associateBy { it.path }.toMutableMap()
+                    additions.forEach { addition ->
+                        val previous = pending[addition.path]
+                        if (previous == null || previous.sha256 != addition.sha256 || previous.version != addition.version || previous.size != addition.size) {
+                            pending[addition.path] = addition
+                        }
+                    }
+                    pending.values.toList()
+                }
+                _lastError.value = null
+                preferences.database.saveDownloads(DownloadSnapshot(queueFolder, _tasks.value, false))
+                resume()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _paused.value = true
+                _lastError.value = error.message ?: "Не удалось сохранить очередь"
+            }
+          }
         }
-        _lastError.value = null
-        resume()
     }
 
     fun pause() {
@@ -77,14 +162,26 @@ class DownloadManager(
         _statusMessage.value = "Загрузка на паузе"
     }
 
-    fun resume() {
+    @Synchronized fun resume() {
         _paused.value = false
+        _tasks.update { tasks -> tasks.map { if (it.status == DownloadStatus.ERROR) it.copy(status = DownloadStatus.QUEUED, error = null) else it } }
         if (job?.isActive == true) return
-        job = scope.launch { runQueue() }
+        job = scope.launch {
+            try {
+                restored.await()
+                runQueue()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _lastError.value = e.message
+                _statusMessage.value = e.message ?: "Не удалось начать загрузку"
+            }
+        }
     }
 
     fun cancel() {
         job?.cancel()
+        activeCall.getAndSet(null)?.cancel()
         job = null
         _running.value = false
         _paused.value = false
@@ -95,11 +192,18 @@ class DownloadManager(
 
     private suspend fun runQueue() {
         val folder = preferences.folderUriOnce()?.let(Uri::parse)
+        if (queueFolder != null && folder?.toString() != queueFolder) {
+            _paused.value = true
+            _statusMessage.value = "Выберите исходную папку очереди или отмените загрузку"
+            return
+        }
         if (folder == null) {
+            _paused.value = true
             _statusMessage.value = "Сначала выберите папку для музыки"
             return
         }
         if (!storage.root(folder).canWrite()) {
+            _paused.value = true
             _statusMessage.value = "Нет записи в выбранную папку. Выберите папку ещё раз."
             _lastError.value = "SAF не дал write-доступ к папке назначения."
             return
@@ -107,37 +211,45 @@ class DownloadManager(
         val endpoint = server.pickEndpoint(preferences.lanUrlOnce(), preferences.tailscaleUrlOnce())
         _endpoint.value = endpoint
         if (endpoint == null) {
+            _paused.value = true
             _statusMessage.value = "Сервер недоступен по LAN и Tailscale"
             return
         }
         val mode = preferences.networkModeOnce()
         if (!network.canDownload(mode, endpoint.channel)) {
+            _paused.value = true
             _statusMessage.value = "Загрузка запрещена текущей сетью. Разрешите Tailscale или любые сети в настройках."
             return
         }
 
         startForegroundService()
         _running.value = true
-        ArtLog.clearUi()
-        refreshArtContext(endpoint)
-        _statusMessage.value = channelLabel(endpoint.channel)
-        ArtLog.d("download.queue.start", "tasks=${_tasks.value.size}")
-
         try {
+            ArtLog.clearUi()
+            refreshArtContext(endpoint)
+            _statusMessage.value = channelLabel(endpoint.channel)
+            ArtLog.d("download.queue.start", "tasks=${_tasks.value.size}")
+
             while (true) {
+                currentCoroutineContext().ensureActive()
+                val queueJob = currentCoroutineContext()[Job]
                 if (_paused.value) {
                     delay(400)
                     continue
                 }
                 val next = mutex.withLock {
-                    val list = _tasks.value.toMutableList()
-                    val index = list.indexOfFirst { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.PAUSED }
-                    if (index < 0) null
-                    else {
-                        list[index] = list[index].copy(status = DownloadStatus.RUNNING, error = null)
-                        _tasks.value = list
-                        list[index]
+                    var selected: DownloadTask? = null
+                    _tasks.update { list ->
+                        val index = list.indexOfFirst { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.PAUSED }
+                        if (index < 0 || job !== queueJob) {
+                            selected = null
+                            list
+                        } else {
+                            selected = list[index].copy(status = DownloadStatus.RUNNING, error = null)
+                            list.mapIndexed { position, task -> if (position == index) selected!! else task }
+                        }
                     }
+                    selected
                 } ?: break
 
                 if (!network.canDownload(preferences.networkModeOnce(), endpoint.channel)) {
@@ -153,7 +265,11 @@ class DownloadManager(
                     ArtLog.d("download.audio.done", next.path)
                 } catch (_: PausedException) {
                     // already marked as paused
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
+                    currentCoroutineContext().ensureActive()
+                    if (_paused.value) { markPaused(next.path, null); continue }
                     if (e is IOException && (e.message?.contains("timeout", true) == true ||
                             e.message?.contains("Failed to connect", true) == true ||
                             e.message?.contains("Unable to resolve", true) == true)
@@ -171,78 +287,84 @@ class DownloadManager(
                 }
             }
             val hasErrors = _tasks.value.any { it.status == DownloadStatus.ERROR }
+            if (hasErrors) _paused.value = true
             _statusMessage.value = if (hasErrors) {
                 _lastError.value?.let { "Готово, есть ошибки. $it" } ?: "Готово, есть ошибки"
             } else {
                 "Все выбранные треки скачаны"
             }
             onFinished()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            _lastError.value = e.message
+            _statusMessage.value = e.message ?: "Не удалось выполнить загрузку"
         } finally {
-            _running.value = false
-            context.stopService(Intent(context, MusicDownloadService::class.java))
+            if (job === currentCoroutineContext()[Job]) {
+                _running.value = false
+                context.stopService(Intent(context, MusicDownloadService::class.java))
+            }
         }
     }
 
     private suspend fun downloadOne(folder: Uri, endpoint: ServerEndpoint, task: DownloadTask) {
-        val file = storage.createOrOpenFile(folder, task.path)
-        var existing = file.length().coerceAtLeast(0L)
-        if (existing > task.size && task.size > 0) {
-            existing = 0L
-        }
-        if (task.size > 0 && existing == task.size) {
-            updateTask(task.path) {
-                it.copy(bytesDownloaded = existing, status = DownloadStatus.DONE)
-            }
-            downloadSidecar(folder, endpoint.baseUrl, task, file.uri)
-            return
-        }
-
-        val call = server.downloadCall(endpoint.baseUrl, task.path, existing)
-        call.execute().use { response ->
-            if (response.code == 416) {
-                updateTask(task.path) { it.copy(bytesDownloaded = task.size, status = DownloadStatus.DONE) }
-                downloadSidecar(folder, endpoint.baseUrl, task, file.uri)
-                return
-            }
-            if (!response.isSuccessful && response.code != 206) {
-                throw IOException("HTTP ${response.code} для ${task.path}")
-            }
-            val body = response.body ?: throw IOException("Пустой ответ")
-            val pfd = context.contentResolver.openFileDescriptor(
-                file.uri,
-                if (existing > 0 && response.code == 206) "rw" else "rwt",
-            ) ?: throw IOException("Не удалось открыть файл для записи")
-            pfd.use { descriptor ->
-                FileOutputStream(descriptor.fileDescriptor).use { output ->
-                    if (existing > 0 && response.code == 206) {
-                        output.channel.position(existing)
+        currentCoroutineContext().ensureActive()
+        val staged = DownloadFiles.stagedFile(
+            File(context.filesDir, "downloads"), folder.toString(), task.path,
+            task.version ?: task.sha256 ?: "${task.mtime}:${task.size}",
+        )
+        var existing = if (staged.isFile) staged.length() else 0L
+        if (existing > task.size) { staged.delete(); existing = 0L }
+        if (existing < task.size || !staged.exists()) {
+            val call = server.downloadCall(endpoint.baseUrl, task.path, existing, task.sha256)
+            activeCall.set(call)
+            try {
+                call.execute().use { response ->
+                    currentCoroutineContext().ensureActive()
+                    if (response.code == 412 || response.code == 416) {
+                        staged.delete()
+                        throw IOException("Файл на сервере изменился. Обновите список синхронизации")
                     }
-                    val input = body.byteStream()
-                    val buffer = ByteArray(DEFAULT_BUFFER)
-                    var downloaded = existing
-                    var read: Int
-                    while (input.read(buffer).also { read = it } != -1) {
-                        if (_paused.value) {
-                            output.flush()
-                            markPaused(task.path, null, downloaded)
-                            throw PausedException()
-                        }
-                        output.write(buffer, 0, read)
-                        downloaded += read
-                        if (downloaded % (DEFAULT_BUFFER * 8) < DEFAULT_BUFFER) {
-                            updateTask(task.path) {
-                                it.copy(bytesDownloaded = downloaded, status = DownloadStatus.RUNNING)
+                    if (!response.isSuccessful) throw IOException("HTTP ${response.code}: ${task.path}")
+                    if (response.code == 206) {
+                        val start = response.header("Content-Range")?.substringAfter("bytes ")
+                            ?.substringBefore('-')?.toLongOrNull()
+                        if (start != existing) throw IOException("Некорректный диапазон ответа сервера")
+                    } else existing = 0L
+                    val body = response.body ?: throw IOException("Пустой ответ")
+                    FileOutputStream(staged, existing > 0).use { output ->
+                        var downloaded = existing
+                        val input = body.byteStream()
+                        val buffer = ByteArray(DEFAULT_BUFFER)
+                        while (true) {
+                            currentCoroutineContext().ensureActive()
+                            if (_paused.value) {
+                                output.fd.sync()
+                                markPaused(task.path, null, downloaded)
+                                throw PausedException()
+                            }
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                            downloaded += count
+                            if (downloaded % (DEFAULT_BUFFER * 8) < DEFAULT_BUFFER) {
+                                updateTask(task.path) { it.copy(bytesDownloaded = downloaded) }
                             }
                         }
-                    }
-                    output.flush()
-                    updateTask(task.path) {
-                        it.copy(bytesDownloaded = downloaded, status = DownloadStatus.DONE)
+                        output.fd.sync()
                     }
                 }
-            }
+            } finally { activeCall.compareAndSet(call, null) }
         }
-        downloadSidecar(folder, endpoint.baseUrl, task, file.uri)
+        currentCoroutineContext().ensureActive()
+        try { DownloadFiles.verify(staged, task.size, task.sha256) }
+        catch (error: IOException) { staged.delete(); throw error }
+        val checksum = task.sha256 ?: DownloadFiles.sha256(staged)
+        val downloadJob = currentCoroutineContext()[Job]
+        val uri = storage.replaceVerified(folder, task.path, staged, checksum) { downloadJob?.isActive == true && !_paused.value }
+        staged.delete()
+        updateTask(task.path) { it.copy(bytesDownloaded = task.size, status = DownloadStatus.DONE, error = null) }
+        downloadSidecar(folder, endpoint.baseUrl, task, uri)
     }
 
     private suspend fun downloadSidecar(
@@ -339,7 +461,7 @@ class DownloadManager(
     }
 
     private fun updateTask(path: String, transform: (DownloadTask) -> DownloadTask) {
-        _tasks.value = _tasks.value.map { if (it.path == path) transform(it) else it }
+        _tasks.update { tasks -> tasks.map { if (it.path == path) transform(it) else it } }
     }
 
     private fun channelLabel(channel: ConnectionChannel): String = when (channel) {

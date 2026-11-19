@@ -17,6 +17,7 @@ data class Track(
     val trackNumber: Int?,
     val addedAt: Long,
     val mimeType: String,
+    val sha256: String? = null,
 ) {
     val folder: String
         get() = relativePath.substringBeforeLast('/', missingDelimiterValue = "").ifBlank { "/" }
@@ -39,12 +40,15 @@ data class RemoteFile(
     val size: Long,
     val mtime: Long = 0L,
     val hasArt: Boolean = false,
+    val sha256: String? = null,
+    val version: String? = null,
 )
 
 enum class DownloadStatus {
     QUEUED, RUNNING, PAUSED, DONE, ERROR
 }
 
+@Serializable
 data class DownloadTask(
     val path: String,
     val size: Long,
@@ -53,6 +57,8 @@ data class DownloadTask(
     val bytesDownloaded: Long = 0L,
     val status: DownloadStatus = DownloadStatus.QUEUED,
     val error: String? = null,
+    val sha256: String? = null,
+    val version: String? = null,
 ) {
     val progress: Float
         get() = if (size <= 0L) 0f else (bytesDownloaded.toFloat() / size.toFloat()).coerceIn(0f, 1f)

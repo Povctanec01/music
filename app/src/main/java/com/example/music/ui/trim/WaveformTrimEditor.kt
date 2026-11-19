@@ -24,6 +24,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
@@ -276,26 +278,33 @@ private fun TrimHandle(
     onDrag: (Float) -> Unit,
 ) {
     val half = handleWidthPx / 2f
+    val currentCenter by rememberUpdatedState(centerX)
+    val currentOnDrag by rememberUpdatedState(onDrag)
     val left = (centerX - half).coerceIn(0f, max(0f, widthPx - handleWidthPx))
     Box(
         Modifier
             .offset { IntOffset(left.roundToInt(), 0) }
             .width(with(LocalDensity.current) { handleWidthPx.toDp() })
             .fillMaxHeight()
-            .pointerInput(centerX) {
-                detectHorizontalDragGestures { change, _ ->
-                    change.consume()
-                    onDrag(change.position.x.coerceIn(0f, widthPx))
-                }
+            .pointerInput(widthPx) {
+                var dragX = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { dragX = currentCenter },
+                    onHorizontalDrag = { change, amount ->
+                        change.consume()
+                        dragX = (dragX + amount).coerceIn(0f, widthPx)
+                        currentOnDrag(dragX)
+                    },
+                )
             },
     )
 }
 
 private fun formatTimePrecise(sec: Float): String {
     if (!sec.isFinite() || sec < 0f) return "00:00.0"
-    val minutes = (sec / 60f).toInt()
-    val seconds = sec % 60f
-    val tenths = ((seconds * 10f).roundToInt() % 10).coerceIn(0, 9)
-    val wholeSeconds = seconds.toInt()
+    val totalTenths = (sec * 10f).roundToInt()
+    val minutes = totalTenths / 600
+    val tenths = totalTenths % 10
+    val wholeSeconds = totalTenths / 10 % 60
     return "${minutes.toString().padStart(2, '0')}:${wholeSeconds.toString().padStart(2, '0')}.$tenths"
 }

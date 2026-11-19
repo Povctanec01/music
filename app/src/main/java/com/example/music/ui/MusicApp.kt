@@ -154,9 +154,10 @@ fun MusicApp() {
             if (event == Lifecycle.Event.ON_RESUME) {
                 scope.launch {
                     if (preferences.pendingUpdateRestartOnce()) {
-                        preferences.clearPendingUpdateRestart()
-                        restartApp()
-                        return@launch
+                        if (updates.onInstallerReturned()) {
+                            restartApp()
+                            return@launch
+                        }
                     }
                     if (!updates.state.value.checking) {
                         updates.checkForUpdates()

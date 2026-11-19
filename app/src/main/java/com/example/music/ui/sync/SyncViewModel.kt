@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.music.MusicApplication
+import com.example.music.domain.SyncComparison
 import com.example.music.domain.model.ConnectionChannel
 import com.example.music.domain.model.RemoteFile
 import com.example.music.domain.model.ServerEndpoint
@@ -125,7 +126,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val byPath = local.associateBy { it.relativePath.lowercase() }
         return remoteFiles.filter { remoteFile ->
             val localTrack = byPath[remoteFile.path.lowercase()]
-            localTrack == null || localTrack.size != remoteFile.size
+            SyncComparison.needsDownload(localTrack?.size, localTrack?.sha256, remoteFile.size, remoteFile.sha256)
         }
     }
 }

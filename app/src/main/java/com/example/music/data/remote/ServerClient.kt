@@ -17,11 +17,19 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Interceptor
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 
-class ServerClient(private val json: Json) {
+class ServerClient(private val json: Json, private val tokenProvider: () -> String = { "" }) {
+    private val authorization = Interceptor { chain ->
+        val request = chain.request()
+        val token = tokenProvider()
+        val writes = request.method !in setOf("GET", "HEAD", "OPTIONS") ||
+            request.url.encodedPath in setOf("/api/art/refresh", "/api/art/prefetch", "/api/library/refresh", "/api/trash")
+        chain.proceed(if (writes && token.isNotBlank()) request.newBuilder().header("Authorization", "Bearer $token").build() else request)
+    }
 
     private val healthClient = OkHttpClient.Builder()
         .connectTimeout(2, TimeUnit.SECONDS)
@@ -30,12 +38,14 @@ class ServerClient(private val json: Json) {
         .build()
 
     private val http = OkHttpClient.Builder()
+        .addInterceptor(authorization)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
     private val prefetchHttp = OkHttpClient.Builder()
+        .addInterceptor(authorization)
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(8, TimeUnit.SECONDS)
         .callTimeout(10, TimeUnit.SECONDS)
@@ -51,11 +61,11 @@ class ServerClient(private val json: Json) {
 
     suspend fun health(baseUrl: String): Boolean = withContext(Dispatchers.IO) {
         if (baseUrl.isBlank()) return@withContext false
-        val request = Request.Builder()
-            .url(normalize(baseUrl) + "/api/health")
-            .get()
-            .build()
         try {
+            val request = Request.Builder()
+                .url(normalize(baseUrl) + "/api/health")
+                .get()
+                .build()
             healthClient.newCall(request).execute().use { it.isSuccessful }
         } catch (_: Exception) {
             false
@@ -170,6 +180,8 @@ class ServerClient(private val json: Json) {
             .build()
         val request = Request.Builder()
             .url(normalize(baseUrl) + "/api/upload?path=$encodedPath")
+            .header("X-File-Size", bytes.size.toString())
+            .header("X-Content-SHA256", java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) })
             .post(body)
             .build()
         http.newCall(request).execute().use { response ->
@@ -180,8 +192,8 @@ class ServerClient(private val json: Json) {
         }
     }
 
-    fun downloadCall(baseUrl: String, relativePath: String, offset: Long) =
-        downloadHttp.newCall(downloadRequest(baseUrl, relativePath, offset))
+    fun downloadCall(baseUrl: String, relativePath: String, offset: Long, sha256: String? = null) =
+        downloadHttp.newCall(downloadRequest(baseUrl, relativePath, offset, sha256))
 
     suspend fun downloadFileBytes(baseUrl: String, relativePath: String): ByteArray? =
         withContext(Dispatchers.IO) {
@@ -231,12 +243,13 @@ class ServerClient(private val json: Json) {
             }
         }
 
-    private fun downloadRequest(baseUrl: String, relativePath: String, offset: Long): Request {
+    private fun downloadRequest(baseUrl: String, relativePath: String, offset: Long, sha256: String? = null): Request {
         val encoded = relativePath.split('/')
             .joinToString("/") { part ->
                 URLEncoder.encode(part, StandardCharsets.UTF_8.name()).replace("+", "%20")
             }
         val builder = Request.Builder().url(normalize(baseUrl) + "/files/" + encoded)
+        if (!sha256.isNullOrBlank()) builder.header("If-Match", "\"$sha256\"")
         if (offset > 0) {
             builder.header("Range", "bytes=$offset-")
         }

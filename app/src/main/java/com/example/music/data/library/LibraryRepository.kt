@@ -5,11 +5,15 @@ import android.content.Intent
 import android.net.Uri
 import com.example.music.data.local.MusicScanner
 import com.example.music.data.local.SafStorage
+import com.example.music.data.local.TrashEntry
 import com.example.music.data.preferences.AppPreferences
 import com.example.music.domain.art.TrackArtRepository
 import com.example.music.domain.model.Track
 import com.example.music.player.PlaybackController
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,6 +23,8 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class LibraryRepository(
     private val context: Context,
@@ -29,6 +35,8 @@ class LibraryRepository(
     private val playbackController: PlaybackController,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scanMutex = Mutex()
+    @Volatile private var indexedFolder: String? = null
 
     private val _tracks = MutableStateFlow<List<Track>>(emptyList())
     val tracks: StateFlow<List<Track>> = _tracks.asStateFlow()
@@ -38,15 +46,17 @@ class LibraryRepository(
 
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
+    private val _lastDeleted = MutableStateFlow<TrashEntry?>(null)
+    val lastDeleted: StateFlow<TrashEntry?> = _lastDeleted.asStateFlow()
 
     init {
         scope.launch {
+            _lastDeleted.value = preferences.database.lastTrash()
             preferences.folderUri.collectLatest { uriString ->
                 if (!uriString.isNullOrBlank()) {
                     val cached = preferences.cachedTracks(uriString)
-                    if (cached.isNotEmpty()) {
-                        _tracks.value = cached
-                    }
+                    _tracks.value = cached
+                    indexedFolder = uriString
                     scan(
                         uri = Uri.parse(uriString),
                         cachedByRelativePath = cached.associateBy { it.relativePath.lowercase() },
@@ -54,6 +64,7 @@ class LibraryRepository(
                     )
                 } else {
                     _tracks.value = emptyList()
+                    indexedFolder = null
                 }
             }
         }
@@ -70,6 +81,8 @@ class LibraryRepository(
             resolver.takePersistableUriPermission(uri, writeFlag)
         }.recoverCatching {
             resolver.takePersistableUriPermission(uri, readFlag)
+        }.onFailure {
+            _error.value = it.message ?: "Нет доступа к выбранной папке"
         }.getOrThrow()
         preferences.setFolderUri(uri.toString())
     }
@@ -83,10 +96,15 @@ class LibraryRepository(
         return withContext(Dispatchers.IO) {
             try {
                 val folder = preferences.folderUriOnce()?.let(Uri::parse) ?: return@withContext false
-                val deletedAudio = storage.deleteDocument(track.uri) ||
-                    storage.deleteRelativeFile(folder, track.relativePath)
-                storage.deleteSidecarsForAudio(folder, track.relativePath, track.uri)
-                if (!deletedAudio) return@withContext false
+                if (indexedFolder != folder.toString() || _tracks.value.none { it.id == track.id }) return@withContext false
+                val hidden = storage.moveToTrash(folder, track.relativePath)
+                try {
+                    val id = preferences.database.addTrash(folder.toString(), track.relativePath, hidden)
+                    _lastDeleted.value = TrashEntry(id, folder.toString(), track.relativePath, hidden)
+                } catch (error: Exception) {
+                    storage.restoreFromTrash(folder, track.relativePath, hidden)
+                    throw error
+                }
 
                 trackArtRepository.evictTrack(track)
                 _tracks.update { tracks -> tracks.filter { it.id != track.id } }
@@ -99,11 +117,25 @@ class LibraryRepository(
         }
     }
 
+    suspend fun undoDelete(): Boolean = withContext(Dispatchers.IO) {
+        val entry = _lastDeleted.value ?: return@withContext false
+        try {
+            storage.restoreFromTrash(Uri.parse(entry.folder), entry.originalPath, entry.hiddenPath)
+            preferences.database.removeTrash(entry.id)
+            _lastDeleted.value = preferences.database.lastTrash()
+            scan(showLoading = false)
+            true
+        } catch (error: Exception) {
+            _error.value = error.message ?: "Не удалось восстановить трек"
+            false
+        }
+    }
+
     suspend fun scan(
         uri: Uri? = null,
         cachedByRelativePath: Map<String, Track> = emptyMap(),
         showLoading: Boolean = true,
-    ) {
+    ) = scanMutex.withLock {
         val folder = uri ?: preferences.folderUriOnce()?.let(Uri::parse) ?: return
         val folderString = folder.toString()
         _isScanning.value = showLoading
@@ -115,9 +147,14 @@ class LibraryRepository(
                 preferences.cachedTracks(folderString).associateBy { it.relativePath.lowercase() }
             }
             val result = withContext(Dispatchers.IO) { scanner.scan(folder, cachedMap) }
+            currentCoroutineContext().ensureActive()
+            if (preferences.folderUriOnce() != folderString) return@withLock
             _tracks.value = result
+            indexedFolder = folderString
             preferences.saveCachedTracks(folderString, result)
             trackArtRepository.reloadTracks(result)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: SecurityException) {
             _error.value = "Нет доступа к папке. Выберите её ещё раз."
             _tracks.value = emptyList()

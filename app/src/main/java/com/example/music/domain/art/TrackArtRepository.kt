@@ -2,7 +2,6 @@ package com.example.music.domain.art
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import com.example.music.domain.metadata.TrackMetadataReader
 import com.example.music.domain.model.Track
@@ -43,6 +42,7 @@ class TrackArtRepository(
         data object Loading : ArtLoadState
         data class Ready(val bitmap: Bitmap) : ArtLoadState
         data object Missing : ArtLoadState
+        data object Evicted : ArtLoadState
     }
 
     private data class ArtRequest(
@@ -115,7 +115,12 @@ class TrackArtRepository(
     }
 
     fun reloadTracks(tracks: List<Track>) {
-        tracks.forEach { ensureLoadedForTrack(it) }
+        // Lazy lists request their visible artwork separately. Do not decode
+        // the entire library into StateFlows after every scan.
+        tracks.filter {
+            val key = TrackArtCache.key(it.relativePath)
+            (mutableFlows[key]?.subscriptionCount?.value ?: 0) > 0
+        }.forEach { ensureLoadedForTrack(it) }
     }
 
     fun ensureLoadedForTrack(track: Track) {
@@ -307,7 +312,7 @@ class TrackArtRepository(
     }
 
     private fun decodeBitmap(bytes: ByteArray): Bitmap? =
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        TrackArtCache.decode(bytes)
             ?.takeIf { it.width > 1 && it.height > 1 }
 
     private fun localCachedBitmap(cacheKey: String): Bitmap? {
@@ -332,6 +337,11 @@ class TrackArtRepository(
     private fun publishReady(cacheKey: String, flow: MutableStateFlow<ArtLoadState>, bitmap: Bitmap) {
         TrackArtCache.put(cacheKey, bitmap)
         flow.value = ArtLoadState.Ready(bitmap)
+        // StateFlows also hold strong bitmap references, independently of LRU.
+        val unused = mutableFlows.entries.filter {
+            it.key != cacheKey && it.value.subscriptionCount.value == 0 && it.value.value is ArtLoadState.Ready
+        }
+        unused.dropLast(16).forEach { (_, state) -> state.value = ArtLoadState.Evicted }
         ArtLog.d("art.ready", cacheKey)
     }
 }

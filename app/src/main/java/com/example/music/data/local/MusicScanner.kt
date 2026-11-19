@@ -8,6 +8,10 @@ import com.example.music.domain.metadata.TrackMetadataReader
 import com.example.music.domain.model.Track
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import java.security.MessageDigest
+import java.io.IOException
 
 class MusicScanner(private val context: Context) {
 
@@ -26,7 +30,7 @@ class MusicScanner(private val context: Context) {
         )
     }
 
-    private fun walk(
+    private suspend fun walk(
         treeUri: Uri,
         documentId: String,
         relativeDir: String,
@@ -48,6 +52,7 @@ class MusicScanner(private val context: Context) {
             val sizeIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
             val modifiedIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
             while (cursor.moveToNext()) {
+                currentCoroutineContext().ensureActive()
                 val id = cursor.getString(idIdx) ?: continue
                 val name = cursor.getString(nameIdx) ?: continue
                 if (name.startsWith(".")) continue
@@ -73,7 +78,7 @@ class MusicScanner(private val context: Context) {
         }
     }
 
-    private fun readMetadata(
+    private suspend fun readMetadata(
         uri: Uri,
         displayName: String,
         mime: String,
@@ -85,7 +90,9 @@ class MusicScanner(private val context: Context) {
         // Пропускаем повторное чтение, если файл не изменился и метаданные уже полные.
         val cacheKey = relativePath.replace('\\', '/').lowercase()
         val cached = cachedTracksByRelativePath[cacheKey]
-        if (cached != null && cached.size == size && cached.addedAt == lastModified &&
+        val unchanged = cached != null && cached.size == size && cached.addedAt == lastModified && lastModified > 0
+        val checksum = if (unchanged && cached?.sha256 != null) cached.sha256 else checksum(uri)
+        if (cached != null && cached.size == size && cached.addedAt == lastModified && checksum != null && cached.sha256 == checksum &&
             !TrackMetadataReader.needsMetadataRefresh(cached, displayName)
         ) {
             return cached.copy(
@@ -93,6 +100,7 @@ class MusicScanner(private val context: Context) {
                 uri = uri,
                 displayName = displayName,
                 relativePath = relativePath.replace('\\', '/'),
+                sha256 = checksum,
             )
         }
 
@@ -111,6 +119,21 @@ class MusicScanner(private val context: Context) {
             trackNumber = metadata.trackNumber,
             addedAt = lastModified,
             mimeType = mime.ifBlank { AudioFormats.mimeForFileName(displayName) },
+            sha256 = checksum,
         )
     }
+
+    private suspend fun checksum(uri: Uri): String? = try {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(1024 * 1024)
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }
+    } catch (_: IOException) { null }
 }

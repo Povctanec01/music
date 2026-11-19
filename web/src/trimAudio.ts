@@ -1,6 +1,9 @@
 /** Decode, slice, and encode a WAV blob for the trim editor. */
 
 export async function trimAudioFile(file: Blob, startSec: number, endSec: number): Promise<Blob> {
+  if (!Number.isFinite(startSec) || !Number.isFinite(endSec) || startSec < 0 || endSec <= startSec) {
+    throw new Error('Неверный диапазон обрезки')
+  }
   const buffer = await file.arrayBuffer()
   const ctx = new AudioContext()
   let decoded: AudioBuffer

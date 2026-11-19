@@ -11,12 +11,12 @@ export async function decodeWaveformPeaks(blob: Blob, barCount = 600): Promise<n
   }
 
   const channel = decoded.getChannelData(0)
-  const blockSize = Math.max(1, Math.floor(channel.length / barCount))
+  if (!Number.isInteger(barCount) || barCount <= 0) throw new Error('Неверное число столбцов')
   const peaks: number[] = []
 
   for (let i = 0; i < barCount; i += 1) {
-    const start = i * blockSize
-    const end = Math.min(start + blockSize, channel.length)
+    const start = Math.floor(i * channel.length / barCount)
+    const end = Math.min(Math.max(start + 1, Math.floor((i + 1) * channel.length / barCount)), channel.length)
     let max = 0
     for (let j = start; j < end; j += 1) {
       max = Math.max(max, Math.abs(channel[j]))
@@ -30,8 +30,9 @@ export async function decodeWaveformPeaks(blob: Blob, barCount = 600): Promise<n
 
 export function formatTimePrecise(sec: number) {
   if (!Number.isFinite(sec) || sec < 0) return '00:00.0'
-  const minutes = Math.floor(sec / 60)
-  const seconds = sec % 60
+  const tenths = Math.round(sec * 10)
+  const minutes = Math.floor(tenths / 600)
+  const seconds = (tenths % 600) / 10
   return `${String(minutes).padStart(2, '0')}:${seconds.toFixed(1).padStart(4, '0')}`
 }
 
@@ -40,6 +41,6 @@ export function parseTimePrecise(value: string): number | null {
   if (!match) return null
   const minutes = Number(match[1])
   const seconds = Number(match[2])
-  if (!Number.isFinite(minutes) || !Number.isFinite(seconds)) return null
+  if (!Number.isFinite(minutes) || !Number.isFinite(seconds) || seconds >= 60) return null
   return minutes * 60 + seconds
 }

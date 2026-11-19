@@ -2,7 +2,7 @@ package com.example.music.domain.metadata
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import com.example.music.domain.art.TrackArtCache
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import com.example.music.domain.art.TrackArtSources
@@ -92,7 +92,7 @@ object TrackMetadataReader {
         return try {
             retriever.setDataSourceSafe(context, uri)
             retriever.embeddedPicture?.let { bytes ->
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                TrackArtCache.decode(bytes)
             }
         } catch (_: Exception) {
             null

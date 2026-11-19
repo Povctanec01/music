@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import cgi
+import io
 import hashlib
 import json
 import mimetypes
@@ -14,8 +14,16 @@ import urllib.parse
 import urllib.request
 import shutil
 import threading
+import wave
+import tempfile
+import sqlite3
+import secrets
+import uuid
+from email import policy
+from email.parser import BytesHeaderParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from contextlib import closing
 
 MUSIC_DIR = Path(os.environ.get("MUSIC_DIR", "/srv/music")).resolve()
 WEB_DIR = Path(os.environ.get("WEB_DIR", "/opt/music-server/web")).resolve()
@@ -24,8 +32,13 @@ HOST = os.environ.get("MUSIC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MUSIC_PORT", "8080"))
 AUDIO_EXT = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav"}
 CACHE_TTL_SEC = 30
+API_TOKEN = os.environ.get("MUSIC_API_TOKEN", "")
+TOKEN_FILE = os.environ.get("MUSIC_API_TOKEN_FILE", "")
+ALLOWED_ORIGINS = {value.strip() for value in os.environ.get("MUSIC_ALLOWED_ORIGINS", "").split(",") if value.strip()}
+_file_lock = threading.RLock()
 
 _cache: tuple[float, list[dict]] | None = None
+_metadata_cache: dict[str, tuple[int, int, int, dict]] = {}
 _prefetch_lock = threading.Lock()
 _prefetch_scheduled = False
 
@@ -40,6 +53,63 @@ def sidecar_has_art(audio_path: Path) -> bool:
         return sidecar.is_file() and sidecar.stat().st_size > 128
     except OSError:
         return False
+
+
+def audio_metadata(path: Path) -> dict:
+    """Optional tags/duration; unreadable metadata never hides a library file."""
+    try:
+        from mutagen import File
+        audio = File(str(path), easy=True)
+        if audio is not None:
+            tags = audio.tags or {}
+            return {
+                "durationMs": round(audio.info.length * 1000),
+                **{key: str((tags.get(key) or [""])[0]) for key in ("title", "artist", "album")},
+            }
+    except Exception:
+        pass
+    if path.suffix.lower() == ".wav":
+        try:
+            with wave.open(str(path), "rb") as audio:
+                return {"durationMs": round(audio.getnframes() / audio.getframerate() * 1000)}
+        except (OSError, EOFError, wave.Error):
+            pass
+    return {}
+
+
+def indexed_metadata(path: Path, relative: str, stat) -> dict:
+    """Persist expensive metadata and hashes; only read changed audio."""
+    ART_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(ART_CACHE_DIR / "library.sqlite3", timeout=30)) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS tracks (path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, ctime INTEGER, metadata TEXT)")
+        row = db.execute("SELECT size, mtime, ctime, metadata FROM tracks WHERE path=?", (relative,)).fetchone()
+        if row and row[:3] == (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns):
+            return json.loads(row[3])
+        digest = hash_file(path)
+        after = path.stat()
+        if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns):
+            raise OSError("file changed during indexing")
+        metadata = {**audio_metadata(path), "sha256": digest, "version": f"{stat.st_mtime_ns}:{digest}"}
+        db.execute("INSERT OR REPLACE INTO tracks VALUES (?,?,?,?,?)", (relative, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, json.dumps(metadata)))
+        db.commit()
+        return metadata
+
+
+def hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_token() -> str:
+    if TOKEN_FILE:
+        try:
+            return Path(TOKEN_FILE).read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return API_TOKEN
 
 
 def list_library(force: bool = False) -> list[dict]:
@@ -60,14 +130,25 @@ def list_library(force: bool = False) -> list[dict]:
                 try:
                     rel = path.relative_to(MUSIC_DIR).as_posix()
                     stat = path.stat()
-                except OSError:
+                    path.resolve().relative_to(MUSIC_DIR)
+                except (OSError, ValueError):
                     continue
+                cached_metadata = _metadata_cache.get(rel)
+                if cached_metadata and cached_metadata[:3] == (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns):
+                    metadata = cached_metadata[3]
+                else:
+                    try:
+                        metadata = indexed_metadata(path, rel, stat)
+                    except OSError:
+                        continue
+                    _metadata_cache[rel] = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, metadata)
                 files.append(
                     {
                         "path": rel,
                         "size": stat.st_size,
                         "mtime": int(stat.st_mtime),
                         "hasArt": sidecar_has_art(path),
+                        **metadata,
                     }
                 )
         files.sort(key=lambda item: item["path"].lower())
@@ -77,8 +158,8 @@ def list_library(force: bool = False) -> list[dict]:
 
 
 def safe_file(relative: str) -> Path | None:
-    relative = urllib.parse.unquote(relative).lstrip("/")
-    if not relative or ".." in Path(relative).parts:
+    relative = relative.lstrip("/")
+    if not relative or any(part.startswith(".") for part in Path(relative).parts):
         return None
     candidate = (MUSIC_DIR / relative).resolve()
     try:
@@ -91,7 +172,8 @@ def safe_file(relative: str) -> Path | None:
 
 
 def safe_directory(relative: str) -> Path | None:
-    relative = urllib.parse.unquote(relative).strip("/")
+    # Query parameters have already been decoded by parse_qs.
+    relative = relative.strip("/")
     if not relative:
         return MUSIC_DIR
     if ".." in Path(relative).parts:
@@ -174,7 +256,11 @@ def extract_embedded_cover(file_path: Path) -> tuple[bytes, str] | None:
     except Exception:
         pass
 
-    audio = File(str(file_path))
+    try:
+        audio = File(str(file_path))
+    except Exception:
+        # Broken/unsupported audio must not abort uploads or the cover worker.
+        return None
     if audio is None:
         return None
 
@@ -390,7 +476,10 @@ def schedule_art_prefetch(files: list[dict], force: bool = False) -> None:
                     continue
                 if not force and entry.get("hasArt"):
                     continue
-                ensure_art_for_relative(relative)
+                try:
+                    ensure_art_for_relative(relative)
+                except Exception as exc:
+                    print(f"Cover prefetch failed for {relative}: {exc}")
         finally:
             with _prefetch_lock:
                 _prefetch_scheduled = False
@@ -420,8 +509,15 @@ def refresh_library_art(force_sidecar: bool = True) -> dict:
     for entry in files:
         relative = entry["path"]
         if force_sidecar:
-            clear_sidecar_art(relative)
             clear_cached_art(relative)
+            # A hand-provided sidecar can be the only original cover. Keep it
+            # available as fallback while trying embedded art again.
+            target = safe_file(relative)
+            extracted = extract_cover(target) if target else None
+            if extracted and target:
+                payload, mime = extracted
+                store_sidecar_art(target, payload)
+                store_cached_art(relative, int(target.stat().st_mtime), payload, mime)
         if ensure_art_for_relative(relative):
             refreshed += 1
             entry["hasArt"] = True
@@ -475,14 +571,13 @@ def safe_web_path(relative: str) -> Path | None:
 
 
 def parse_version_tag(tag_name: str) -> tuple[str, int] | tuple[None, None]:
-    tag = tag_name.strip().lstrip("v")
-    if "+" not in tag:
+    match = re.fullmatch(r"v?([0-9][0-9A-Za-z._-]*)\+([0-9]+)", tag_name.strip())
+    if not match:
         return None, None
-    version_name, _, version_code = tag.rpartition("+")
-    try:
-        return version_name, int(version_code)
-    except ValueError:
+    version_code = int(match[2])
+    if not 0 < version_code <= 2_100_000_000:
         return None, None
+    return match[1], version_code
 
 
 def github_latest_release(repo: str) -> dict:
@@ -516,13 +611,173 @@ def github_latest_release(repo: str) -> dict:
 
 def content_disposition(filename: str) -> str:
     ascii_fallback = filename.encode("ascii", "ignore").decode("ascii").strip()
-    ascii_fallback = ascii_fallback.replace("\\", "_").replace('"', "_") or "download"
+    ascii_fallback = re.sub(r'[\x00-\x1f\x7f\\"]', '_', ascii_fallback) or "download"
     utf8_name = urllib.parse.quote(filename, safe="")
     return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_name}"
 
 
+class MultipartReader:
+    """Bounded multipart reader; audio parts are spooled to disk, not RAM."""
+    def __init__(self, stream, length: int):
+        self.stream = stream
+        self.remaining = length
+        self.buffer = b""
+
+    def copy_until(self, markers: tuple[bytes, ...], output, limit: int | None = None) -> int:
+        written = 0
+        keep = max(map(len, markers)) - 1
+        while True:
+            hits = [(self.buffer.find(marker), index, marker) for index, marker in enumerate(markers)]
+            hits = [hit for hit in hits if hit[0] >= 0]
+            if hits:
+                offset, index, marker = min(hits)
+                if limit is not None and written + offset > limit:
+                    raise ValueError("multipart headers too large")
+                output.write(self.buffer[:offset])
+                self.buffer = self.buffer[offset + len(marker):]
+                return index
+            count = max(0, len(self.buffer) - keep)
+            if limit is not None and written + count > limit:
+                raise ValueError("multipart headers too large")
+            output.write(self.buffer[:count])
+            written += count
+            self.buffer = self.buffer[count:]
+            if self.remaining <= 0:
+                raise ValueError("incomplete multipart body")
+            chunk = self.stream.read(min(64 * 1024, self.remaining))
+            if not chunk:
+                raise ValueError("incomplete multipart body")
+            self.remaining -= len(chunk)
+            self.buffer += chunk
+
+    def parts(self, content_type: str):
+        header = BytesHeaderParser(policy=policy.default).parsebytes(
+            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8")
+        )
+        boundary = header.get_boundary()
+        if not boundary or len(boundary) > 200:
+            raise ValueError("invalid multipart boundary")
+        delimiter = b"--" + boundary.encode("ascii")
+        self.copy_until((delimiter + b"\r\n",), io.BytesIO(), limit=1024)
+        while True:
+            headers = io.BytesIO()
+            self.copy_until((b"\r\n\r\n",), headers, limit=64 * 1024)
+            part = BytesHeaderParser(policy=policy.default).parsebytes(headers.getvalue() + b"\r\n\r\n")
+            with tempfile.TemporaryFile() as file:
+                final = self.copy_until((b"\r\n" + delimiter + b"\r\n", b"\r\n" + delimiter + b"--"), file)
+                file.seek(0)
+                yield part.get_param("name", header="content-disposition"), part.get_filename(), file
+            if final:
+                # Consume any epilogue so a persistent connection remains valid.
+                while self.remaining:
+                    chunk = self.stream.read(min(64 * 1024, self.remaining))
+                    if not chunk:
+                        raise ValueError("incomplete multipart body")
+                    self.remaining -= len(chunk)
+                return
+
+
+def trash_root() -> Path:
+    root = (MUSIC_DIR / ".trash").resolve()
+    root.relative_to(MUSIC_DIR)
+    root.mkdir(exist_ok=True)
+    return root
+
+
+def move_to_trash(target: Path) -> str:
+    relative = target.relative_to(MUSIC_DIR).as_posix()
+    identifier = uuid.uuid4().hex
+    entry = trash_root() / identifier
+    entry.mkdir()
+    sources = [target] + [target.with_suffix(ext) for ext in (".jpg", ".jpeg", ".png", ".webp") if target.with_suffix(ext).is_file()]
+    for source in sources:
+        source.resolve().relative_to(MUSIC_DIR)
+    metadata = {"id": identifier, "path": relative, "deletedAt": int(time.time()), "files": [p.name for p in sources]}
+    (entry / "entry.json").write_text(json.dumps(metadata), encoding="utf-8")
+    moved = []
+    try:
+        for source in sources:
+            os.replace(source, entry / source.name)
+            moved.append(source)
+    except OSError:
+        for source in reversed(moved):
+            os.replace(entry / source.name, source)
+        raise
+    return identifier
+
+
+def trash_entries() -> list[dict]:
+    entries = []
+    for file in trash_root().glob("*/entry.json"):
+        try:
+            entry = json.loads(file.read_text(encoding="utf-8"))
+            if (file.parent / Path(entry["path"]).name).is_file():
+                entries.append({key: entry[key] for key in ("id", "path", "deletedAt")})
+        except (OSError, ValueError, KeyError):
+            continue
+    return sorted(entries, key=lambda item: item["deletedAt"], reverse=True)
+
+
+def restore_trash(identifier: str) -> str:
+    if not re.fullmatch(r"[a-f0-9]{32}", identifier):
+        raise ValueError("invalid trash id")
+    entry = trash_root() / identifier
+    metadata = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
+    relative = metadata["path"]
+    target_dir = safe_directory(str(Path(relative).parent))
+    if target_dir is None:
+        raise ValueError("invalid restore path")
+    sources = []
+    for name in metadata["files"]:
+        if Path(name).name != name or name in {".", ".."}:
+            raise ValueError("invalid trash file")
+        source = entry / name
+        if source.is_file():
+            if (target_dir / name).exists():
+                raise FileExistsError(name)
+            sources.append(source)
+    if not sources:
+        raise FileNotFoundError(identifier)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    moved = []
+    try:
+        for source in sources:
+            os.replace(source, target_dir / source.name)
+            moved.append(source)
+    except OSError:
+        for source in reversed(moved):
+            os.replace(target_dir / source.name, source)
+        raise
+    invalidate_cache()
+    return relative
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def _origin_allowed(self) -> bool:
+        origin = self.headers.get("Origin")
+        return not origin or origin == self._base_url() or origin in ALLOWED_ORIGINS
+
+    def _require_write_auth(self) -> bool:
+        token = write_token()
+        if not token:
+            self.close_connection = True
+            self._json(503, {"error": "Write access is not configured"})
+            return False
+        supplied = self.headers.get("Authorization", "")
+        if not self._origin_allowed() or not secrets.compare_digest(supplied.encode("utf-8"), f"Bearer {token}".encode("utf-8")):
+            self.close_connection = True
+            self._json(401, {"error": "Server access token required"})
+            return False
+        return True
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except ConnectionError:
+            # Browsers cancel range downloads when seeking or replacing src.
+            self.close_connection = True
 
     def _base_url(self) -> str:
         # Used to build absolute links for clients (web/Android) without
@@ -539,6 +794,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path in {"/api/art/refresh", "/api/art/prefetch", "/api/library/refresh", "/api/trash"} and not self._require_write_auth():
+            return
+        if path == "/api/trash":
+            self._json(200, {"files": trash_entries()})
+            return
         if path == "/api/health":
             self._json(200, {"status": "ok"})
             return
@@ -584,7 +844,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(502, {"error": str(exc)})
             return
         if path.startswith("/files/"):
-            self._send_file(path[len("/files/") :])
+            self._send_file(urllib.parse.unquote(path[len("/files/") :]))
             return
         if path == "/api/art/refresh":
             try:
@@ -610,17 +870,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(exc)})
             return
         if path.startswith("/api/art/"):
-            self._send_art(path[len("/api/art/") :])
+            self._send_art(urllib.parse.unquote(path[len("/api/art/") :]))
             return
         if self._serve_web(path):
             return
         self._json(404, {"error": "not found"})
 
     def do_OPTIONS(self) -> None:
+        if not self._origin_allowed():
+            self._json(403, {"error": "Origin is not allowed"})
+            return
         self.send_response(204)
         self._send_cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Range, Authorization, X-Content-SHA256, X-File-Size")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -632,7 +895,20 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_POST(self) -> None:
+        if not self._require_write_auth():
+            return
         parsed = urllib.parse.urlparse(self.path)
+        match = re.fullmatch(r"/api/trash/([a-f0-9]{32})/restore", parsed.path)
+        if match:
+            try:
+                with _file_lock:
+                    relative = restore_trash(match[1])
+                self._json(200, {"restored": relative})
+            except FileExistsError:
+                self._json(409, {"error": "A file with this name already exists"})
+            except (OSError, ValueError):
+                self._json(404, {"error": "Trash entry not found"})
+            return
         if parsed.path == "/api/upload":
             self._upload(parsed.query)
             return
@@ -641,7 +917,11 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(length) if length else b"{}"
                 body = json.loads(raw.decode("utf-8") or "{}")
+                if not isinstance(body, dict):
+                    raise ValueError("JSON object expected")
                 paths = body.get("paths") or []
+                if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+                    raise ValueError("paths must be an array of strings")
                 force = bool(body.get("force"))
                 if paths:
                     self._json(200, prefetch_art_for_paths(paths, force=force))
@@ -658,15 +938,19 @@ class Handler(BaseHTTPRequestHandler):
                             "status": "prefetch_scheduled",
                         },
                     )
+            except (ValueError, UnicodeError) as exc:
+                self._json(400, {"error": str(exc)})
             except Exception as exc:
                 self._json(500, {"error": str(exc)})
             return
         self._json(404, {"error": "not found"})
 
     def do_DELETE(self) -> None:
+        if not self._require_write_auth():
+            return
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path.startswith("/api/file/"):
-            self._delete_file(parsed.path[len("/api/file/") :])
+            self._delete_file(urllib.parse.unquote(parsed.path[len("/api/file/") :]))
             return
         self._json(404, {"error": "not found"})
 
@@ -676,13 +960,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "file not found"})
             return
         try:
-            target.unlink()
+            with _file_lock:
+                trash_id = move_to_trash(target)
         except OSError as exc:
             self._json(500, {"error": str(exc)})
             return
         clear_cached_art(target.relative_to(MUSIC_DIR).as_posix())
         invalidate_cache()
-        self._json(200, {"deleted": target.relative_to(MUSIC_DIR).as_posix()})
+        self._json(200, {"deleted": target.relative_to(MUSIC_DIR).as_posix(), "trashId": trash_id})
 
     def _json(self, code: int, payload: dict, body: bool = True) -> None:
         data = json.dumps(payload).encode("utf-8")
@@ -692,11 +977,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        if body:
+        if body and self.command != "HEAD":
             self.wfile.write(data)
 
     def _send_cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if self.headers.get("Origin") and self._origin_allowed():
+            self.send_header("Access-Control-Allow-Origin", self.headers["Origin"])
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range")
 
     def _send_art(self, relative: str) -> None:
@@ -720,24 +1007,36 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "file not found"})
             return
         size = target.stat().st_size
+        if self.headers.get("If-Match"):
+            metadata = indexed_metadata(target, relative, target.stat())
+            if self.headers["If-Match"] != f'"{metadata["sha256"]}"':
+                self._json(412, {"error": "File changed"})
+                return
         mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         range_header = self.headers.get("Range")
         start = 0
         end = size - 1
         status = 200
         if range_header and range_header.startswith("bytes="):
-            spec = range_header.split("=", 1)[1].split(",")[0].strip()
-            left, _, right = spec.partition("-")
+            spec = range_header.split("=", 1)[1].strip()
+            match = re.fullmatch(r"([0-9]*)-([0-9]*)", spec)
             try:
+                if not match or not any(match.groups()) or size == 0:
+                    raise ValueError("Invalid Range")
+                left, right = match.groups()
                 if left:
                     start = int(left)
-                if right:
-                    end = int(right)
+                    end = min(int(right), size - 1) if right else size - 1
+                else:
+                    suffix_length = int(right)
+                    if suffix_length <= 0:
+                        raise ValueError("Invalid suffix length")
+                    start = max(0, size - suffix_length)
+                if start >= size or end < start:
+                    raise ValueError("Unsatisfiable Range")
             except ValueError:
-                self.send_error(400, "Invalid Range")
-                return
-            if start >= size:
                 self.send_response(416)
+                self._send_cors_headers()
                 self.send_header("Content-Range", f"bytes */{size}")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -777,12 +1076,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", mime)
             if size:
                 self.send_header("Content-Length", size)
+            else:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.send_header("Content-Disposition", content_disposition(filename))
             self.end_headers()
 
-            shutil.copyfileobj(response, self.wfile)
+            if self.command != "HEAD":
+                shutil.copyfileobj(response, self.wfile)
 
     def _serve_web(self, path: str) -> bool:
+        if path.startswith(("/api/", "/files/")):
+            return False
         if not WEB_DIR.exists():
             return False
         relative = path.lstrip("/")
@@ -806,36 +1111,40 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _upload(self, query: str) -> None:
+        try:
+            self._upload_files(query)
+        except (ValueError, UnicodeError) as exc:
+            self.close_connection = True
+            self._json(400, {"error": str(exc)})
+        except OSError as exc:
+            self.close_connection = True
+            self._json(500, {"error": str(exc)})
+
+    def _upload_files(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
         relative_dir = params.get("path", [""])[0]
         target_dir = safe_directory(relative_dir)
         if target_dir is None:
+            self.close_connection = True
             self._json(400, {"error": "invalid upload path"})
             return
         content_type = self.headers.get("Content-Type", "")
         if "multipart/form-data" not in content_type:
+            self.close_connection = True
             self._json(400, {"error": "multipart/form-data expected"})
             return
 
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={
-                "REQUEST_METHOD": "POST",
-                "CONTENT_TYPE": content_type,
-            },
-        )
-        fields = form["files"] if "files" in form else []
-        if not isinstance(fields, list):
-            fields = [fields]
-        if not fields:
-            self._json(400, {"error": "no files uploaded"})
-            return
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            raise ValueError("Content-Length is required")
+        reader = MultipartReader(self.rfile, length)
 
         uploaded: list[dict] = []
         target_dir.mkdir(parents=True, exist_ok=True)
-        for item in fields:
-            filename = Path(item.filename or "").name
+        for field, uploaded_name, file in reader.parts(content_type):
+            if field != "files":
+                continue
+            filename = Path((uploaded_name or "").replace("\\", "/")).name
             if not filename or filename.startswith(".") or Path(filename).suffix.lower() not in AUDIO_EXT:
                 continue
             destination = (target_dir / filename).resolve()
@@ -843,17 +1152,29 @@ class Handler(BaseHTTPRequestHandler):
                 destination.relative_to(MUSIC_DIR)
             except ValueError:
                 continue
-            with destination.open("wb") as output:
-                while True:
-                    chunk = item.file.read(64 * 1024)
-                    if not chunk:
-                        break
-                    output.write(chunk)
+            staged = target_dir / f".upload-{uuid.uuid4().hex}"
+            try:
+                with staged.open("xb") as output:
+                    shutil.copyfileobj(file, output, 64 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+                checksum = hash_file(staged)
+                expected = self.headers.get("X-Content-SHA256")
+                expected_size = self.headers.get("X-File-Size")
+                if expected and not secrets.compare_digest(checksum, expected.lower()):
+                    raise ValueError("Upload checksum mismatch")
+                if expected_size is not None and staged.stat().st_size != int(expected_size):
+                    raise ValueError("Upload size mismatch")
+                with _file_lock:
+                    os.replace(staged, destination)
+            finally:
+                staged.unlink(missing_ok=True)
             uploaded.append(
                 {
                     "name": filename,
                     "path": destination.relative_to(MUSIC_DIR).as_posix(),
                     "size": destination.stat().st_size,
+                    "sha256": checksum,
                 }
             )
             ensure_art_for_relative(destination.relative_to(MUSIC_DIR).as_posix())
@@ -870,12 +1191,14 @@ def main() -> None:
     MUSIC_DIR.mkdir(parents=True, exist_ok=True)
     ART_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Music API on {HOST}:{PORT}, dir={MUSIC_DIR}")
-    try:
-        initial = list_library(force=True)
-        print(f"Library: {len(initial)} tracks, prefetching covers on server…")
-    except Exception as exc:
-        print(f"Startup library scan failed: {exc}")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+    def initial_scan():
+        try:
+            initial = list_library(force=True)
+            print(f"Library: {len(initial)} tracks, index ready")
+        except Exception as exc:
+            print(f"Startup library scan failed: {exc}")
+    threading.Thread(target=initial_scan, name="library-index", daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

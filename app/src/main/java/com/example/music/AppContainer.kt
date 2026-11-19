@@ -27,7 +27,7 @@ class AppContainer(context: Context) {
     val preferences = AppPreferences(appContext, json)
     val scanner = MusicScanner(appContext)
     val safStorage = SafStorage(appContext)
-    val serverClient = ServerClient(json)
+    val serverClient = ServerClient(json) { preferences.apiToken }
     val sidecarArtSync = SidecarArtSync(appContext, preferences, safStorage, serverClient)
     val trackArtRepository = TrackArtRepository(appContext, sidecarArtSync)
     val networkMonitor = NetworkMonitor(appContext)

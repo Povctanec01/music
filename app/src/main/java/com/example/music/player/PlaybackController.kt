@@ -152,8 +152,6 @@ class PlaybackController(
         val player = controller ?: return
         if (shuffleEnabled) {
             shufflePool = (listOf(track) + shufflePool.filter { it.id != track.id })
-            scope.launch { playWeightedTrack(track) }
-            return
         }
         val insertAt = (player.currentMediaItemIndex + 1).coerceAtMost(player.mediaItemCount)
         player.addMediaItem(insertAt, track.toMediaItem())
@@ -202,6 +200,7 @@ class PlaybackController(
 
     fun toggleShuffle() {
         val player = controller ?: return
+        val wasPlaying = player.playWhenReady
         shuffleEnabled = !shuffleEnabled
         // Weighted radio owns ordering; keep ExoPlayer shuffle off to avoid edge stops.
         player.shuffleModeEnabled = false
@@ -220,7 +219,7 @@ class PlaybackController(
                         player.currentPosition.coerceAtLeast(0L),
                     )
                     player.prepare()
-                    if (_state.value.isPlaying) player.play()
+                    if (wasPlaying) player.play() else player.pause()
                 }
             }
         } else if (shufflePool.isNotEmpty()) {
@@ -232,7 +231,7 @@ class PlaybackController(
                 player.currentPosition.coerceAtLeast(0L),
             )
             player.prepare()
-            if (_state.value.isPlaying) player.play()
+            if (wasPlaying) player.play() else player.pause()
         }
         publish(player)
     }
@@ -265,8 +264,9 @@ class PlaybackController(
     }
 
     fun removeFromQueue(trackId: String) {
+        shufflePool = shufflePool.filter { it.id != trackId }
         val player = controller ?: return
-        var index = player.currentMediaItemIndex
+        var index = 0
         while (index < player.mediaItemCount) {
             val itemIndex = (index until player.mediaItemCount).firstOrNull { idx ->
                 player.getMediaItemAt(idx).mediaId == trackId
@@ -339,17 +339,20 @@ class PlaybackController(
         shufflePool = if (tracks.size >= restoredTracks.size) tracks else restoredTracks
         shuffleEnabled = snapshot.shuffle
         player.shuffleModeEnabled = false
-        val index = snapshot.index.coerceIn(0, restoredTracks.lastIndex)
+        val savedId = snapshot.mediaId ?: snapshot.queueIds.getOrNull(snapshot.index)
+        val savedIndex = restoredTracks.indexOfFirst { it.id == savedId }
+        val index = savedIndex.coerceAtLeast(0)
+        val restoredPosition = if (savedIndex >= 0) snapshot.positionMs else 0L
         if (shuffleEnabled) {
             val current = restoredTracks[index]
             rememberRecent(current.id)
             val queue = buildShuffleQueue(current)
             val startIndex = queue.indexOfFirst { it.id == current.id }.coerceAtLeast(0)
             player.repeatMode = Player.REPEAT_MODE_OFF
-            player.setMediaItems(queue.map { it.toMediaItem() }, startIndex, snapshot.positionMs)
+            player.setMediaItems(queue.map { it.toMediaItem() }, startIndex, restoredPosition)
         } else {
             player.repeatMode = snapshot.repeatMode
-            player.setMediaItems(restoredTracks.map { it.toMediaItem() }, index, snapshot.positionMs)
+            player.setMediaItems(restoredTracks.map { it.toMediaItem() }, index, restoredPosition)
         }
         player.prepare()
         player.pause()
@@ -624,14 +627,18 @@ class PlaybackController(
 
     private suspend fun fadeOutAndPause(player: Player) {
         val original = player.volume
-        var volume = original
-        while (volume > 0.05f) {
-            volume -= 0.07f
-            player.volume = volume.coerceAtLeast(0f)
-            delay(120)
+        try {
+            var volume = original
+            while (volume > 0.05f) {
+                volume -= 0.07f
+                player.volume = volume.coerceAtLeast(0f)
+                delay(120)
+            }
+            player.pause()
+        } finally {
+            // Cancelling a fading timer must also restore the user's volume.
+            player.volume = original
         }
-        player.pause()
-        player.volume = original
     }
 }
 

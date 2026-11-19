@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 data class SettingsUiState(
+    val apiToken: String = "",
     val folderUri: String? = null,
     val lanUrl: String = "",
     val tailscaleUrl: String = "",
@@ -34,6 +35,7 @@ private data class SettingsCore(
     val githubRepo: String,
     val networkMode: DownloadNetworkMode,
     val groupModeOrder: List<GroupMode>,
+    val apiToken: String = "",
 )
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
@@ -71,12 +73,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             groupModeOrder = GroupMode.entries.toList(),
         ))
 
-    private val coreWithOrder = combine(coreBase, preferences.groupModeOrder) { core, order ->
-        core.copy(groupModeOrder = order)
+    private val coreWithOrder = combine(coreBase, preferences.groupModeOrder, preferences.serverToken) { core, order, token ->
+        core.copy(groupModeOrder = order, apiToken = token)
     }
 
     val uiState: StateFlow<SettingsUiState> = combine(coreWithOrder, checking, checkResult) { core, isChecking, result ->
         SettingsUiState(
+            apiToken = core.apiToken,
             folderUri = core.folderUri,
             lanUrl = core.lanUrl,
             tailscaleUrl = core.tailscaleUrl,
@@ -89,8 +92,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SettingsUiState())
 
     fun selectFolder(uri: Uri) {
-        viewModelScope.launch { library.setFolder(uri) }
+        viewModelScope.launch {
+            runCatching { library.setFolder(uri) }
+                .onFailure { checkResult.value = it.message ?: "Нет доступа к выбранной папке" }
+        }
     }
+
+    fun setServerToken(token: String) { viewModelScope.launch { preferences.setServerToken(token) } }
 
     fun setLanUrl(url: String) {
         viewModelScope.launch { preferences.setLanUrl(url) }
@@ -137,5 +145,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun setGroupModeOrder(order: List<GroupMode>) {
         viewModelScope.launch { preferences.setGroupModeOrder(order) }
+    }
+
+    fun restoreLastDeleted() {
+        viewModelScope.launch {
+            checkResult.value = if (library.undoDelete()) "Трек восстановлен" else "Нет доступного трека для восстановления или имя уже занято"
+        }
     }
 }

@@ -18,8 +18,15 @@ import com.example.music.domain.recommendation.TrackBehavior
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import com.example.music.data.local.LibraryDatabase
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "music_prefs")
 
@@ -28,8 +35,17 @@ class AppPreferences(
     private val json: Json,
 ) {
     private val dataStore = context.dataStore
+    val database = LibraryDatabase(context.applicationContext, json)
+    val serverToken: Flow<String> = dataStore.data.map { it[Keys.SERVER_TOKEN].orEmpty() }.distinctUntilChanged()
+    @Volatile var apiToken: String = ""
+        private set
+    init { CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { serverToken.collect { apiToken = it } } }
+    suspend fun setServerToken(token: String) {
+        apiToken = token.trim()
+        dataStore.edit { it[Keys.SERVER_TOKEN] = apiToken }
+    }
 
-    val folderUri: Flow<String?> = dataStore.data.map { it[Keys.FOLDER_URI] }
+    val folderUri: Flow<String?> = dataStore.data.map { it[Keys.FOLDER_URI] }.distinctUntilChanged()
     val lanUrl: Flow<String> = dataStore.data.map {
         it[Keys.LAN_URL] ?: DEFAULT_LAN_URL
     }
@@ -191,20 +207,18 @@ class AppPreferences(
         )
     }
 
-    suspend fun cachedTracks(folderUri: String): List<Track> {
+    suspend fun cachedTracks(folderUri: String): List<Track> = withContext(Dispatchers.IO) {
+        if (database.hasLibrary(folderUri)) return@withContext database.tracks(folderUri)
         val raw = dataStore.data.first()[Keys.CACHED_LIBRARY].orEmpty()
-        if (raw.isBlank()) return emptyList()
-        val snapshot = runCatching { json.decodeFromString<CachedLibrarySnapshot>(raw) }.getOrNull() ?: return emptyList()
-        if (snapshot.folderUri != folderUri) return emptyList()
-        return snapshot.tracks.map { it.toTrack() }
+        val snapshot = runCatching { json.decodeFromString<CachedLibrarySnapshot>(raw) }.getOrNull()
+        val tracks = if (snapshot?.folderUri == folderUri) snapshot.tracks.map { it.toTrack() } else emptyList()
+        database.saveTracks(folderUri, tracks)
+        if (snapshot?.folderUri == folderUri) dataStore.edit { it.remove(Keys.CACHED_LIBRARY) }
+        tracks
     }
 
     suspend fun saveCachedTracks(folderUri: String, tracks: List<Track>) {
-        val snapshot = CachedLibrarySnapshot(
-            folderUri = folderUri,
-            tracks = tracks.map(CachedTrack::fromTrack),
-        )
-        dataStore.edit { it[Keys.CACHED_LIBRARY] = json.encodeToString(snapshot) }
+        withContext(Dispatchers.IO) { database.saveTracks(folderUri, tracks) }
     }
 
     val pendingUpdateRestart: Flow<Boolean> = dataStore.data.map { prefs ->
@@ -212,6 +226,9 @@ class AppPreferences(
     }
 
     suspend fun pendingUpdateRestartOnce(): Boolean = pendingUpdateRestart.first()
+
+    suspend fun pendingUpdateTargetVersionCodeOnce(): Int? =
+        dataStore.data.first()[Keys.PENDING_UPDATE_TARGET_VERSION_CODE]
 
     suspend fun setPendingUpdateRestart(targetVersionCode: Int) {
         dataStore.edit { prefs ->
@@ -254,6 +271,7 @@ class AppPreferences(
     }
 
     private object Keys {
+        val SERVER_TOKEN = stringPreferencesKey("server_token")
         val FOLDER_URI = stringPreferencesKey("folder_uri")
         val LAN_URL = stringPreferencesKey("lan_url")
         val TAILSCALE_URL = stringPreferencesKey("tailscale_url")
@@ -308,7 +326,7 @@ private data class CachedLibrarySnapshot(
 )
 
 @kotlinx.serialization.Serializable
-private data class CachedTrack(
+internal data class CachedTrack(
     val id: String,
     val uri: String,
     val displayName: String,
@@ -322,6 +340,7 @@ private data class CachedTrack(
     val trackNumber: Int? = null,
     val addedAt: Long,
     val mimeType: String,
+    val sha256: String? = null,
 ) {
     fun toTrack(): Track = Track(
         id = id,
@@ -337,6 +356,7 @@ private data class CachedTrack(
         trackNumber = trackNumber,
         addedAt = addedAt,
         mimeType = mimeType,
+        sha256 = sha256,
     )
 
     companion object {
@@ -354,6 +374,7 @@ private data class CachedTrack(
             trackNumber = track.trackNumber,
             addedAt = track.addedAt,
             mimeType = track.mimeType,
+            sha256 = track.sha256,
         )
     }
 }

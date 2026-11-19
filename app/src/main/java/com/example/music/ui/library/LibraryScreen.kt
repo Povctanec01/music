@@ -44,6 +44,10 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -51,6 +55,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -82,6 +87,14 @@ fun LibraryScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val player by viewModel.playback.state.collectAsStateWithLifecycle()
+    val deleted by viewModel.lastDeleted.collectAsStateWithLifecycle()
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(deleted?.id) {
+        if (deleted != null && snackbar.showSnackbar(
+                "Трек перемещён в корзину", actionLabel = "Отменить",
+                withDismissAction = true, duration = SnackbarDuration.Long,
+            ) == SnackbarResult.ActionPerformed) viewModel.undoDelete()
+    }
     var searchOpen by remember { mutableStateOf(false) }
     var sortMenu by remember { mutableStateOf(false) }
     var swapFrom by remember { mutableStateOf<GroupMode?>(null) }
@@ -107,6 +120,7 @@ fun LibraryScreen(
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbar) },
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
@@ -281,7 +295,7 @@ fun LibraryScreen(
             onDismissRequest = { trackToDelete = null },
             title = { Text("Удалить с телефона?") },
             text = {
-                Text("Файл «${track.title}» и его обложка будут удалены с устройства.")
+                Text("Трек «${track.title}» будет перемещён в корзину. Его можно восстановить.")
             },
             confirmButton = {
                 TextButton(

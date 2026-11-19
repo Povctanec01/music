@@ -5,6 +5,7 @@ plugins {
 }
 
 android {
+    buildToolsVersion = "36.1.0"
     namespace = "com.example.music"
     compileSdk {
         version = release(36) {
@@ -16,8 +17,8 @@ android {
         applicationId = "com.example.music"
         minSdk = 33
         targetSdk = 36
-        versionCode = 42
-        versionName = "1.0.30"
+        versionCode = 43
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

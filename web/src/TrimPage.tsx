@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { TrackArt } from './TrackArt'
 import { trimAudioFile } from './trimAudio'
 import { WaveformTrimEditor } from './WaveformTrimEditor'
 import type { MusicTrack } from './types'
+import { uploadAudio } from './api'
 
 type Props = {
   serverUrl: string
@@ -35,13 +36,6 @@ export function TrimPage(props: Props) {
     )
   }, [tracks, query])
 
-  useEffect(() => {
-    setSelected(null)
-    setDuration(0)
-    setStartSec(0)
-    setEndSec(0)
-  }, [tracks.length])
-
   function selectTrack(track: MusicTrack) {
     setSelected(track)
     setDuration(track.durationMs > 0 ? track.durationMs / 1000 : 0)
@@ -73,15 +67,11 @@ export function TrimPage(props: Props) {
       const blob = await trimAudioFile(sourceBlob, startSec, endSec)
       const baseName = selected.title.replace(/\.[^.]+$/, '') || selected.relativePath.replace(/\.[^.]+$/, '')
       const uploadName = `${baseName}.trim.${Math.round(startSec)}-${Math.round(endSec)}.wav`
-      const formData = new FormData()
-      formData.append('files', blob, uploadName)
       const base = serverUrl.replace(/\/$/, '')
-      const uploadResponse = await fetch(`${base}/api/upload?path=${encodeURIComponent(uploadDir)}`, {
-        method: 'POST',
-        body: formData,
-      })
+      const uploadResponse = await uploadAudio(base, uploadDir, blob, uploadName)
       if (!uploadResponse.ok) throw new Error(`Ошибка загрузки: ${uploadResponse.status}`)
       onStatus(`Готово: ${uploadName}`)
+      closeEditor()
       await onUploaded()
     } catch (error) {
       onStatus(error instanceof Error ? error.message : 'Не удалось обрезать файл')
@@ -162,6 +152,7 @@ export function TrimPage(props: Props) {
       ) : selected.remoteUrl ? (
         <article className="panel trim-editor-panel">
           <WaveformTrimEditor
+            key={selected.remoteUrl}
             audioUrl={selected.remoteUrl}
             fileName={selected.relativePath.split('/').pop() ?? selected.title}
             duration={duration}

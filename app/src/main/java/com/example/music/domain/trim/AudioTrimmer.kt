@@ -4,9 +4,12 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.AudioFormat
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -20,9 +23,11 @@ object AudioTrimmer {
         startSec: Float,
         endSec: Float,
     ): ByteArray = withContext(Dispatchers.Default) {
-        require(endSec > startSec) { "Неверный диапазон обрезки" }
-        val startUs = (startSec * 1_000_000f).toLong()
-        val endUs = (endSec * 1_000_000f).toLong()
+        require(startSec.isFinite() && endSec.isFinite() && startSec >= 0 && endSec > startSec) {
+            "Неверный диапазон обрезки"
+        }
+        val startUs = (startSec.toDouble() * 1_000_000).toLong()
+        val endUs = (endSec.toDouble() * 1_000_000).toLong()
 
         val extractor = MediaExtractor()
         try {
@@ -34,12 +39,13 @@ object AudioTrimmer {
             extractor.selectTrack(trackIndex)
             val inputFormat = extractor.getTrackFormat(trackIndex)
             val mime = inputFormat.getString(MediaFormat.KEY_MIME) ?: error("Неизвестный формат аудио")
+            inputFormat.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
 
             val decoder = MediaCodec.createDecoderByType(mime)
             try {
                 decoder.configure(inputFormat, null, null, 0)
                 decoder.start()
-                extractor.seekTo(startUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
                 var sampleRate = inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                 var channels = inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -50,6 +56,7 @@ object AudioTrimmer {
                 var outputDone = false
 
                 while (!outputDone) {
+                    currentCoroutineContext().ensureActive()
                     if (!inputDone) {
                         val inIndex = decoder.dequeueInputBuffer(TIMEOUT_US)
                         if (inIndex >= 0) {
@@ -88,6 +95,10 @@ object AudioTrimmer {
                             val outFormat = decoder.outputFormat
                             sampleRate = outFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                             channels = outFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                            check(!outFormat.containsKey(MediaFormat.KEY_PCM_ENCODING) ||
+                                outFormat.getInteger(MediaFormat.KEY_PCM_ENCODING) == AudioFormat.ENCODING_PCM_16BIT) {
+                                "Декодер не поддерживает 16-битный PCM"
+                            }
                         }
 
                         MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
@@ -96,11 +107,12 @@ object AudioTrimmer {
                             if (outIndex >= 0) {
                                 if (bufferInfo.presentationTimeUs >= endUs) {
                                     outputDone = true
-                                } else if (bufferInfo.size > 0 &&
-                                    bufferInfo.presentationTimeUs >= startUs - 100_000L
-                                ) {
+                                } else if (bufferInfo.size > 0) {
                                     val outBuffer = decoder.getOutputBuffer(outIndex)!!
-                                    pcm.write(outBuffer.getBytes(bufferInfo))
+                                    pcm.write(PcmAudio.slice(
+                                        outBuffer.getBytes(bufferInfo), bufferInfo.presentationTimeUs,
+                                        startUs, endUs, sampleRate, channels,
+                                    ))
                                 }
                                 decoder.releaseOutputBuffer(outIndex, false)
                                 if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
@@ -114,10 +126,8 @@ object AudioTrimmer {
                 if (pcm.size() == 0) error("Не удалось декодировать выбранный фрагмент")
                 encodeWav(pcm.toByteArray(), sampleRate, channels)
             } finally {
-                runCatching {
-                    decoder.stop()
-                    decoder.release()
-                }
+                runCatching { decoder.stop() }
+                decoder.release()
             }
         } finally {
             extractor.release()

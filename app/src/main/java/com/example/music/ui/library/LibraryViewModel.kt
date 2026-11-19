@@ -51,6 +51,9 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     private val preferences = container.preferences
     private val recommendationEngine = container.recommendationEngine
     val playback = container.playbackController
+    val lastDeleted = library.lastDeleted
+
+    fun undoDelete() { viewModelScope.launch { library.undoDelete() } }
 
     private val query = MutableStateFlow("")
     private val browseMode = MutableStateFlow(LibraryBrowseMode.LIST)
@@ -174,7 +177,9 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun selectFolder(uri: Uri) {
-        viewModelScope.launch { library.setFolder(uri) }
+        viewModelScope.launch {
+            runCatching { library.setFolder(uri) }
+        }
     }
 
     fun play(track: Track, queue: List<Track>) {

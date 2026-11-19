@@ -2,7 +2,6 @@ package com.example.music.domain.art
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import java.io.File
 import java.security.MessageDigest
 
@@ -17,7 +16,7 @@ class TrackArtDiskStore(context: Context) {
     fun loadBitmap(cacheKey: String): Bitmap? {
         val file = fileForKey(cacheKey)
         if (!file.isFile || file.length() <= 128L) return null
-        val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+        val bitmap = TrackArtCache.decodeFile(file.absolutePath)
         if (bitmap == null || bitmap.width <= 1 || bitmap.height <= 1) {
             bitmap?.recycle()
             file.delete()
@@ -27,7 +26,7 @@ class TrackArtDiskStore(context: Context) {
     }
 
     fun save(cacheKey: String, bytes: ByteArray): File? {
-        val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val decoded = TrackArtCache.decode(bytes) ?: return null
         return try {
             saveBitmap(cacheKey, decoded)
         } finally {

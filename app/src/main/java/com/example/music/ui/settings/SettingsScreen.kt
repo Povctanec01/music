@@ -115,6 +115,7 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
                         modifier = Modifier.padding(top = 4.dp, bottom = 8.dp),
                     )
                     OutlinedButton(onClick = { picker.launch(null) }) { Text("Выбрать папку") }
+                    OutlinedButton(onClick = viewModel::restoreLastDeleted) { Text("Восстановить последний удалённый трек") }
                 }
             }
 
@@ -122,6 +123,13 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
             ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("Пинг сервера", style = MaterialTheme.typography.titleMedium)
+                    OutlinedTextField(
+                        value = state.apiToken,
+                        onValueChange = viewModel::setServerToken,
+                        label = { Text("Ключ доступа сервера") },
+                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(), singleLine = true,
+                    )
                     Text(
                         "При открытии настроек серверы проверяются автоматически.",
                         style = MaterialTheme.typography.bodySmall,

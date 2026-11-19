@@ -15,6 +15,7 @@ import com.example.music.domain.model.Track
 import com.example.music.domain.trim.AudioTrimmer
 import com.example.music.domain.trim.WaveformPeaks
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -24,6 +25,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.security.MessageDigest
 
 data class TrimUiState(
     val checking: Boolean = false,
@@ -55,6 +57,7 @@ class TrimViewModel(application: Application) : AndroidViewModel(application) {
 
     private val core = MutableStateFlow(TrimUiState())
     private val query = MutableStateFlow("")
+    private var waveformJob: Job? = null
 
     val state: StateFlow<TrimUiState> = combine(core, query, library.tracks) { base, q, tracks ->
         base.copy(libraryTracks = tracks, query = q)
@@ -215,6 +218,7 @@ class TrimViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearSelection() {
+        waveformJob?.cancel()
         core.update {
             it.copy(
                 fileUri = null,
@@ -231,14 +235,18 @@ class TrimViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun loadWaveform(uri: Uri) {
-        viewModelScope.launch {
+        waveformJob?.cancel()
+        waveformJob = viewModelScope.launch {
             val peaks = WaveformPeaks.load(getApplication(), uri)
-            core.update { it.copy(waveformPeaks = peaks, loadingWaveform = false) }
+            core.update {
+                if (it.fileUri == uri) it.copy(waveformPeaks = peaks, loadingWaveform = false) else it
+            }
         }
     }
 
     fun trimAndUpload() {
         val current = core.value
+        if (current.busy) return
         val uri = current.fileUri ?: return
         val endpoint = current.endpoint ?: run {
             core.update { it.copy(error = "Сервер недоступен") }
@@ -292,14 +300,24 @@ class TrimViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun downloadRemoteToCache(endpoint: ServerEndpoint, file: RemoteFile): Uri =
         withContext(Dispatchers.IO) {
             val context = getApplication<Application>()
-            val safeName = file.path.replace('/', '_').replace('\\', '_')
+            val key = "${endpoint.baseUrl}|${file.path}|${file.mtime}|${file.size}"
+            val hash = MessageDigest.getInstance("SHA-256").digest(key.toByteArray())
+                .joinToString("") { "%02x".format(it) }
+            val safeName = "$hash.${file.path.substringAfterLast('.', "audio")}"
             val cache = File(context.cacheDir, "trim_cache/$safeName")
             cache.parentFile?.mkdirs()
             if (!cache.exists() || cache.length() != file.size) {
                 server.downloadCall(endpoint.baseUrl, file.path, 0L).execute().use { response ->
                     if (!response.isSuccessful) error("Не удалось скачать файл: ${response.code}")
                     val body = response.body ?: error("Пустой ответ сервера")
-                    cache.outputStream().use { out -> body.byteStream().copyTo(out) }
+                    val partial = File(cache.parentFile, "${cache.name}.part")
+                    try {
+                        partial.outputStream().use { out -> body.byteStream().copyTo(out) }
+                        check(file.size <= 0 || partial.length() == file.size) { "Файл скачан не полностью" }
+                        check(partial.renameTo(cache)) { "Не удалось сохранить скачанный файл" }
+                    } finally {
+                        partial.delete()
+                    }
                 }
             }
             cache.toUri()

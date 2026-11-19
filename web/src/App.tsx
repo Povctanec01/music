@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import './App.css'
 import { favoriteTracks, groupTracks, LIBRARY_TABS, SORT_MODES, sortTracks, type LibraryTab, type SortMode, formatRelativeAddedAt, groupNewestAddedAt } from './library'
@@ -24,16 +24,21 @@ import {
   saveVolume,
 } from './storage'
 import { TrimPage } from './TrimPage'
+import { TrackArt } from './TrackArt'
+import { authorizedFetch, loadAccessToken, saveAccessToken, uploadAudio } from './api'
+import { TrashPanel } from './TrashPanel'
 import type { ListeningBehavior, MusicTrack, RecommendationSection, ReleaseInfo } from './types'
 
 function App() {
   const [serverUrl, setServerUrl] = useState(loadServerUrl)
+  const [lastDeletedId, setLastDeletedId] = useState<string | null>(null)
   const [githubRepo, setGithubRepo] = useState(loadGithubRepo)
   const [remoteTracks, setRemoteTracks] = useState<MusicTrack[]>([])
   const [favorites, setFavorites] = useState<Set<string>>(new Set(loadFavorites()))
   const [behavior, setBehavior] = useState<Record<string, ListeningBehavior>>(loadBehavior())
   const [queue, setQueue] = useState<MusicTrack[]>([])
   const [currentId, setCurrentId] = useState<string | null>(null)
+  const [playbackRevision, setPlaybackRevision] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
   const [positionMs, setPositionMs] = useState(0)
   const [durationMs, setDurationMs] = useState(0)
@@ -114,13 +119,23 @@ function App() {
     loudnessRef.current?.setEnabled(loudnessNormalize)
   }, [loudnessNormalize])
 
-  useEffect(() => {
+  const initializeLoudness = useEffectEvent(() => {
     const audio = audioRef.current
     if (!audio || loudnessRef.current) return
     loudnessRef.current = createLoudnessController(audio)
     loudnessRef.current.setEnabled(loudnessNormalize)
     loudnessRef.current.setMasterVolume(volume)
+    loudnessRef.current.resetForTrack()
+  })
+
+  useEffect(() => {
+    const audio = audioRef.current
+    if (!audio) return
+    // Create the Web Audio source on first playback. StrictMode rehearses effect
+    // setup/cleanup at mount; an element can only have one media source node.
+    audio.addEventListener('play', initializeLoudness)
     return () => {
+      audio.removeEventListener('play', initializeLoudness)
       loudnessRef.current?.dispose()
       loudnessRef.current = null
     }
@@ -161,14 +176,23 @@ function App() {
 
   useEffect(() => {
     const audio = audioRef.current
-    if (!audio || !currentTrack) return
+    if (!audio) return
+    if (!currentTrack) {
+      audio.pause()
+      audio.removeAttribute('src')
+      audio.load()
+      setIsPlaying(false)
+      return
+    }
     const source = currentTrack.objectUrl ?? currentTrack.remoteUrl
     if (!source) return
     audio.src = source
-    audio.volume = loudnessRef.current ? 1 : volume
     loudnessRef.current?.resetForTrack()
-    void audio.play()
-    setIsPlaying(true)
+    void audio.play().catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+      setIsPlaying(false)
+      setStatus(error instanceof Error ? error.message : 'Не удалось воспроизвести трек')
+    })
     setPositionMs(0)
     setDurationMs(currentTrack.durationMs)
     lastTrackedPosition.current = 0
@@ -178,13 +202,38 @@ function App() {
       playCount: current.playCount + 1,
       lastPlayedAt: Date.now(),
     }))
-  }, [currentTrack])
+    return () => {
+      const listened = pendingListenedMs.current
+      pendingListenedMs.current = 0
+      if (listened > 0) updateBehavior(currentTrack.id, (current) => ({
+        ...current, totalListenedMs: current.totalListenedMs + listened,
+      }))
+    }
+  }, [currentTrack, playbackRevision])
+
+  const handleEnded = useEffectEvent(() => {
+    if (currentTrack) updateBehavior(currentTrack.id, (current) => ({
+      ...current, completionCount: current.completionCount + 1,
+    }))
+    playNext()
+  })
 
   useEffect(() => {
     const audio = audioRef.current
     if (!audio) return
     const onPlay = () => setIsPlaying(true)
-    const onPause = () => setIsPlaying(false)
+    const onPause = () => {
+      setIsPlaying(false)
+      const listened = pendingListenedMs.current
+      pendingListenedMs.current = 0
+      if (currentTrack && listened > 0) updateBehavior(currentTrack.id, (current) => ({
+        ...current, totalListenedMs: current.totalListenedMs + listened,
+      }))
+    }
+    const onError = () => {
+      setIsPlaying(false)
+      setStatus(audio.error?.message || 'Ошибка воспроизведения аудио')
+    }
     const onLoadedMetadata = () => {
       setDurationMs(Number.isFinite(audio.duration) ? audio.duration * 1000 : durationMs)
     }
@@ -205,26 +254,19 @@ function App() {
       }
       lastTrackedPosition.current = nextPosition
     }
-    const onEnded = () => {
-      if (currentTrack) {
-        updateBehavior(currentTrack.id, (current) => ({
-          ...current,
-          completionCount: current.completionCount + 1,
-        }))
-      }
-      playNext()
-    }
     audio.addEventListener('play', onPlay)
     audio.addEventListener('pause', onPause)
     audio.addEventListener('loadedmetadata', onLoadedMetadata)
     audio.addEventListener('timeupdate', onTimeUpdate)
-    audio.addEventListener('ended', onEnded)
+    audio.addEventListener('ended', handleEnded)
+    audio.addEventListener('error', onError)
     return () => {
       audio.removeEventListener('play', onPlay)
       audio.removeEventListener('pause', onPause)
       audio.removeEventListener('loadedmetadata', onLoadedMetadata)
       audio.removeEventListener('timeupdate', onTimeUpdate)
-      audio.removeEventListener('ended', onEnded)
+      audio.removeEventListener('ended', handleEnded)
+      audio.removeEventListener('error', onError)
     }
   }, [currentTrack, durationMs, shuffle, queue, currentIndex, remoteTracks, behavior, favorites])
 
@@ -239,8 +281,14 @@ function App() {
     try {
       const response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/library`)
       if (!response.ok) throw new Error(`Orange Pi API: ${response.status}`)
-      const payload = (await response.json()) as { files: Array<{ path: string; size: number; mtime: number }> }
-      const tracks = payload.files.map((item) => createRemoteTrack(item.path, item.size, item.mtime, serverUrl))
+      const payload = (await response.json()) as { files: Array<{ path: string; size: number; mtime: number; durationMs?: number; title?: string; artist?: string; album?: string }> }
+      const tracks = payload.files.map((item) => ({
+        ...createRemoteTrack(item.path, item.size, item.mtime, serverUrl),
+        durationMs: item.durationMs ?? 0,
+        ...(item.title ? { title: item.title } : {}),
+        ...(item.artist ? { artist: item.artist } : {}),
+        ...(item.album ? { album: item.album } : {}),
+      }))
       setRemoteTracks(tracks)
       setStatus(`На Orange Pi найдено ${tracks.length} файлов.`)
     } catch (error) {
@@ -252,32 +300,34 @@ function App() {
 
   async function uploadFiles(files: FileList | null) {
     if (!files?.length) return
-    setStatus('Загружаю файлы на Orange Pi…')
-    const base = serverUrl.replace(/\/$/, '')
-    for (const file of [...files]) {
-      const formData = new FormData()
-      formData.append('files', file, file.name)
-      const response = await fetch(`${base}/api/upload?path=${encodeURIComponent(uploadDir)}`, {
-        method: 'POST',
-        body: formData,
-      })
-      if (!response.ok) {
-        throw new Error(`Ошибка загрузки ${file.name}: ${response.status}`)
+    try {
+      setStatus('Загружаю файлы на Orange Pi…')
+      const base = serverUrl.replace(/\/$/, '')
+      for (const file of [...files]) {
+        const response = await uploadAudio(base, uploadDir, file, file.name)
+        if (!response.ok) {
+          throw new Error(`Ошибка загрузки ${file.name}: ${response.status}`)
+        }
       }
+      setStatus(`Загружено ${files.length} файлов на Orange Pi.`)
+      await refreshRemoteLibrary()
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Не удалось загрузить файлы')
     }
-    setStatus(`Загружено ${files.length} файлов на Orange Pi.`)
-    await refreshRemoteLibrary()
   }
 
   async function deleteRemoteTrack(track: MusicTrack) {
-    const confirmed = window.confirm(`Удалить «${track.title}» с Orange Pi?`)
+    const confirmed = window.confirm(`Переместить «${track.title}» в корзину Orange Pi?`)
     if (!confirmed) return
     setStatus(`Удаляю ${track.title}…`)
     try {
       const base = serverUrl.replace(/\/$/, '')
       const encodedPath = track.relativePath.split('/').map(encodeURIComponent).join('/')
-      const response = await fetch(`${base}/api/file/${encodedPath}`, { method: 'DELETE' })
+      const response = await authorizedFetch(`${base}/api/file/${encodedPath}`, { method: 'DELETE' })
       if (!response.ok) throw new Error(`Удаление: ${response.status}`)
+      const deleted = await response.json() as { trashId?: string }
+      setLastDeletedId(deleted.trashId ?? null)
+      setQueue((current) => current.filter((item) => item.id !== track.id))
       if (currentId === track.id) {
         setCurrentId(null)
         setIsPlaying(false)
@@ -292,6 +342,16 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Не удалось удалить файл')
     }
+  }
+
+  async function undoDelete() {
+    if (!lastDeletedId) return
+    try {
+      const response = await authorizedFetch(`${serverUrl.replace(/\/$/, '')}/api/trash/${lastDeletedId}/restore`, { method: 'POST' })
+      if (!response.ok) throw new Error(response.status === 409 ? 'Имя уже занято. Откройте корзину в настройках.' : `Восстановление: ${response.status}`)
+      setLastDeletedId(null)
+      await refreshRemoteLibrary()
+    } catch (error) { setStatus(error instanceof Error ? error.message : 'Не удалось восстановить') }
   }
 
   async function fetchLatestRelease() {
@@ -320,6 +380,7 @@ function App() {
     setQueue(pool)
     rememberShuffleId(track.id)
     setCurrentId(track.id)
+    if (currentId === track.id) setPlaybackRevision((value) => value + 1)
   }
 
   function rememberShuffleId(trackId: string) {
@@ -348,7 +409,9 @@ function App() {
   function togglePlayback() {
     const audio = audioRef.current
     if (!audio || !currentTrack) return
-    if (audio.paused) void audio.play()
+    if (audio.paused) void audio.play().catch((error: unknown) => {
+      setStatus(error instanceof Error ? error.message : 'Не удалось воспроизвести трек')
+    })
     else audio.pause()
   }
 
@@ -366,6 +429,7 @@ function App() {
         setQueue(pool)
       }
       setCurrentId(next.id)
+      if (currentId === next.id) setPlaybackRevision((value) => value + 1)
       return
     }
     if (currentIndex < 0 || currentIndex >= queue.length - 1) {
@@ -383,6 +447,7 @@ function App() {
       const previous = previousId ? (remoteTracks.length ? remoteTracks : queue).find((track) => track.id === previousId) : null
       if (!previous) return
       maybeRecordSkip()
+      recent.pop()
       setCurrentId(previous.id)
       return
     }
@@ -542,6 +607,7 @@ function App() {
             path="/trim"
             element={
               <TrimPage
+                key={serverUrl}
                 serverUrl={serverUrl}
                 tracks={remoteTracks}
                 loadingLibrary={loadingRemote}
@@ -592,7 +658,7 @@ function App() {
         </NavLink>
       </nav>
 
-      {status ? <div className="toast">{status}</div> : null}
+      {status ? <div className="toast">{status} {lastDeletedId && <button type="button" onClick={() => void undoDelete()}>Отменить удаление</button>}</div> : null}
 
       {currentTrack ? (
         <footer className="player-bar" ref={playerBarRef}>
@@ -1046,6 +1112,8 @@ function SettingsPage(props: {
   } = props
   const hasDirectoryPicker =
     typeof (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function'
+  const [tokenDraft, setTokenDraft] = useState(() => ({ base: serverUrl, value: loadAccessToken(serverUrl) }))
+  const accessToken = tokenDraft.base === serverUrl ? tokenDraft.value : loadAccessToken(serverUrl)
 
   useEffect(() => {
     let cancelled = false
@@ -1082,6 +1150,13 @@ function SettingsPage(props: {
         <label className="field">
           Базовый URL сервера
           <input value={serverUrl} onChange={(event) => onServerUrlChange(event.target.value)} />
+        </label>
+        <label className="field">
+          Ключ доступа сервера
+          <input type="password" autoComplete="off" value={accessToken} onChange={event => {
+            setTokenDraft({ base: serverUrl, value: event.target.value })
+            saveAccessToken(event.target.value, serverUrl)
+          }} />
         </label>
         <p className="subtitle" style={{ marginTop: -6, marginBottom: 12 }}>
           Если сайт открыт с Orange Pi (LAN или Tailscale), используется адрес текущей страницы автоматически.
@@ -1143,6 +1218,8 @@ function SettingsPage(props: {
           />
         </label>
       </article>
+
+      <TrashPanel key={serverUrl} serverUrl={serverUrl} onRestored={onRefresh} />
 
       <article className="panel">
         <div className="section-heading">
@@ -1264,34 +1341,6 @@ function TrackActionsMenu(props: { track: MusicTrack; onDelete: () => void }) {
       ) : null}
     </div>
   )
-}
-
-function TrackArt(props: { track: MusicTrack; className?: string; fallback?: string }) {
-  const { track, className, fallback } = props
-  // Prefer YouTube thumb when present (many .m4a have no embedded art; Pi can't fetch YT).
-  const sources = [track.youtubeArtUrl, track.artUrl].filter(Boolean) as string[]
-  const [sourceIndex, setSourceIndex] = useState(0)
-  const label = (fallback ?? track.title[0] ?? '♪').toUpperCase()
-
-  useEffect(() => {
-    setSourceIndex(0)
-  }, [track.id, track.artUrl, track.youtubeArtUrl])
-
-  const src = sources[sourceIndex]
-  if (src) {
-    return (
-      <img
-        src={src}
-        alt=""
-        className={className}
-        loading="eager"
-        referrerPolicy="no-referrer"
-        onError={() => setSourceIndex((current) => current + 1)}
-      />
-    )
-  }
-
-  return <span className={className}>{label}</span>
 }
 
 function TrackCard(props: {

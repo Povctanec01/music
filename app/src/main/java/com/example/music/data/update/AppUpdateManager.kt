@@ -37,7 +37,7 @@ data class AppUpdateState(
     val message: String? = null,
 ) {
     val updateAvailable: Boolean
-        get() = (latestRelease?.versionCode ?: -1) > currentVersionCode
+        get() = (latestRelease?.versionCode ?: -1) > currentVersionCode && !latestRelease?.apkUrl.isNullOrBlank()
 }
 
 class AppUpdateManager(
@@ -80,6 +80,7 @@ class AppUpdateManager(
 
     suspend fun checkForUpdates() {
         checkMutex.withLock {
+        if (_state.value.downloading || _state.value.installing) return
         val repo = preferences.githubRepoOnce().trim()
         _state.update {
             it.copy(
@@ -92,7 +93,7 @@ class AppUpdateManager(
             )
         }
         if (repo.isBlank()) {
-            _state.update { it.copy(checking = false) }
+            _state.update { it.copy(checking = false, latestRelease = null, serverBaseUrl = null) }
             return
         }
         runCatching {
@@ -119,6 +120,7 @@ class AppUpdateManager(
             _state.update {
                 it.copy(
                     checking = false,
+                    latestRelease = null,
                     message = error.message ?: "Не удалось проверить обновления",
                 )
             }
@@ -127,10 +129,12 @@ class AppUpdateManager(
     }
 
     suspend fun downloadAndInstall() {
-        val release = state.value.latestRelease ?: error("Сначала проверь обновления")
-        val fileName = release.apkFileName?.takeIf { it.endsWith(".apk", ignoreCase = true) } ?: "music-update.apk"
-        val targetVersionCode = release.versionCode ?: error("В релизе нет versionCode (нельзя установить и перезапустить приложение)")
-        val baseUrl = state.value.serverBaseUrl ?: error("Orange Pi baseUrl не найден. Сначала проверь обновления.")
+        if (_state.value.downloading || _state.value.installing) return
+        val release = state.value.latestRelease ?: return
+        val fileName = release.apkFileName?.substringAfterLast('/')?.substringAfterLast('\\')
+            ?.takeIf { it.endsWith(".apk", ignoreCase = true) } ?: "music-update.apk"
+        val targetVersionCode = release.versionCode ?: return
+        val baseUrl = state.value.serverBaseUrl ?: return
         val encodedRepo = URLEncoder.encode(release.repo, StandardCharsets.UTF_8.name())
         val apkUrl = "${baseUrl}/api/apk/latest?repo=$encodedRepo"
         _state.update {
@@ -211,5 +215,16 @@ class AppUpdateManager(
         } catch (_: ActivityNotFoundException) {
             error("Не найден установщик пакетов на устройстве")
         }
+    }
+
+    suspend fun onInstallerReturned(): Boolean {
+        val targetVersion = preferences.pendingUpdateTargetVersionCodeOnce()
+        preferences.clearPendingUpdateRestart()
+        val installedVersion = context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
+        val installed = targetVersion != null && installedVersion >= targetVersion
+        _state.update {
+            it.copy(installing = false, message = if (installed) "Обновление установлено" else "Установка не завершена")
+        }
+        return installed
     }
 }
