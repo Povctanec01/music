@@ -1186,8 +1186,10 @@
 }
 
 .player-btn-icon.active {
-  color: #8ca2ff;
-  background: rgba(140, 162, 255, 0.16);
+  color: #0d1220;
+  background: linear-gradient(135deg, #8ba4ff, #6ecfff);
+  border-color: #8ca2ff;
+  box-shadow: 0 0 0 2px rgba(140, 162, 255, 0.24);
 }
 
 .seek-wrap {

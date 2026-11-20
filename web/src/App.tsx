@@ -27,6 +27,7 @@ import { TrimPage } from './TrimPage'
 import { TrackArt } from './TrackArt'
 import { authorizedFetch, loadAccessToken, saveAccessToken, uploadAudio } from './api'
 import { TrashPanel } from './TrashPanel'
+import { registerMediaActions, updateMediaMetadata, updateMediaPlayback, updateMediaPosition } from './mediaSession'
 import type { ListeningBehavior, MusicTrack, RecommendationSection, ReleaseInfo } from './types'
 
 function App() {
@@ -78,6 +79,38 @@ function App() {
   )
   const currentIndex = queue.findIndex((track) => track.id === currentId)
   const currentTrack = currentIndex >= 0 ? queue[currentIndex] : null
+  const hasTrack = currentTrack !== null
+  const canGoNext = hasTrack && (shuffle ? (remoteTracks.length || queue.length) > 1 : currentIndex < queue.length - 1)
+  const canGoPrevious = hasTrack && (shuffle ? recentShuffleIdsRef.current.length >= 2 : currentIndex > 0)
+
+  const mediaPlay = useEffectEvent(() => resumePlayback())
+  const mediaPause = useEffectEvent(() => audioRef.current?.pause())
+  const mediaNext = useEffectEvent(() => { maybeRecordSkip(); playNext() })
+  const mediaPrevious = useEffectEvent(() => playPrevious())
+  const mediaSeek = useEffectEvent((details: MediaSessionActionDetails) => {
+    const audio = audioRef.current
+    if (!audio || !Number.isFinite(details.seekTime) || !Number.isFinite(audio.duration)) return
+    audio.currentTime = Math.max(0, Math.min(audio.duration, details.seekTime!))
+    lastTrackedPosition.current = audio.currentTime * 1000
+    setPositionMs(audio.currentTime * 1000)
+  })
+
+  useEffect(() => registerMediaActions(navigator.mediaSession, {
+    play: hasTrack ? () => mediaPlay() : null,
+    pause: hasTrack ? () => mediaPause() : null,
+    nexttrack: canGoNext ? () => mediaNext() : null,
+    previoustrack: canGoPrevious ? () => mediaPrevious() : null,
+    seekto: hasTrack ? (details) => mediaSeek(details) : null,
+  }), [hasTrack, canGoNext, canGoPrevious])
+
+  useEffect(() => { updateMediaMetadata(navigator.mediaSession, currentTrack) }, [currentTrack])
+  useEffect(() => { updateMediaPlayback(navigator.mediaSession, hasTrack, isPlaying) }, [hasTrack, isPlaying])
+  useEffect(() => { updateMediaPosition(navigator.mediaSession, hasTrack ? durationMs : 0, positionMs) }, [hasTrack, durationMs, positionMs])
+  useEffect(() => () => {
+    updateMediaMetadata(navigator.mediaSession, null)
+    updateMediaPlayback(navigator.mediaSession, false, false)
+    updateMediaPosition(navigator.mediaSession, 0, 0)
+  }, [])
 
   useEffect(() => {
     saveServerUrl(serverUrl)
@@ -409,10 +442,16 @@ function App() {
   function togglePlayback() {
     const audio = audioRef.current
     if (!audio || !currentTrack) return
-    if (audio.paused) void audio.play().catch((error: unknown) => {
+    if (audio.paused) resumePlayback()
+    else audio.pause()
+  }
+
+  function resumePlayback() {
+    const audio = audioRef.current
+    if (!audio || !currentTrack) return
+    void audio.play().catch((error: unknown) => {
       setStatus(error instanceof Error ? error.message : 'Не удалось воспроизвести трек')
     })
-    else audio.pause()
   }
 
   function playNext() {
@@ -676,10 +715,13 @@ function App() {
                   type="button"
                   className={`player-btn player-btn-icon${shuffle ? ' active' : ''}`}
                   onClick={() => setShuffle((current) => !current)}
-                  aria-label="Shuffle"
+                  aria-label="Случайное воспроизведение"
+                  aria-pressed={shuffle}
                   title={shuffle ? 'Случайный (рекомендации)' : 'По порядку'}
                 >
-                  🔀
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="m18 2 4 4-4 4M18 14l4 4-4 4M2 18h2.5C10.5 18 13.5 6 19.5 6H22M2 6h2.5c2.4 0 4.5 2.6 6.4 5.3M14 14.7c1.6 2 3.3 3.3 5.5 3.3H22" />
+                  </svg>
                 </button>
                 <button type="button" className="player-btn player-btn-icon" onClick={playPrevious} aria-label="Назад">
                   ⏮
