@@ -27,6 +27,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "music_prefs")
 
@@ -36,6 +38,7 @@ class AppPreferences(
 ) {
     private val dataStore = context.dataStore
     val database = LibraryDatabase(context.applicationContext, json)
+    private val libraryCacheMutex = Mutex()
     val serverToken: Flow<String> = dataStore.data.map { it[Keys.SERVER_TOKEN].orEmpty() }.distinctUntilChanged()
     @Volatile var apiToken: String = ""
         private set
@@ -208,17 +211,19 @@ class AppPreferences(
     }
 
     suspend fun cachedTracks(folderUri: String): List<Track> = withContext(Dispatchers.IO) {
-        if (database.hasLibrary(folderUri)) return@withContext database.tracks(folderUri)
-        val raw = dataStore.data.first()[Keys.CACHED_LIBRARY].orEmpty()
-        val snapshot = runCatching { json.decodeFromString<CachedLibrarySnapshot>(raw) }.getOrNull()
-        val tracks = if (snapshot?.folderUri == folderUri) snapshot.tracks.map { it.toTrack() } else emptyList()
-        database.saveTracks(folderUri, tracks)
-        if (snapshot?.folderUri == folderUri) dataStore.edit { it.remove(Keys.CACHED_LIBRARY) }
-        tracks
+        libraryCacheMutex.withLock {
+            if (database.hasLibrary(folderUri)) return@withLock database.tracks(folderUri)
+            val raw = dataStore.data.first()[Keys.CACHED_LIBRARY].orEmpty()
+            val snapshot = runCatching { json.decodeFromString<CachedLibrarySnapshot>(raw) }.getOrNull()
+            val tracks = if (snapshot?.folderUri == folderUri) snapshot.tracks.map { it.toTrack() } else emptyList()
+            database.saveTracks(folderUri, tracks)
+            if (snapshot?.folderUri == folderUri) dataStore.edit { it.remove(Keys.CACHED_LIBRARY) }
+            tracks
+        }
     }
 
     suspend fun saveCachedTracks(folderUri: String, tracks: List<Track>) {
-        withContext(Dispatchers.IO) { database.saveTracks(folderUri, tracks) }
+        withContext(Dispatchers.IO) { libraryCacheMutex.withLock { database.saveTracks(folderUri, tracks) } }
     }
 
     val pendingUpdateRestart: Flow<Boolean> = dataStore.data.map { prefs ->

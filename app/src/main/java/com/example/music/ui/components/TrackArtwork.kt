@@ -10,6 +10,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -31,7 +32,7 @@ fun TrackArtwork(
     fallbackLabel: String? = null,
 ) {
     val repo = (LocalContext.current.applicationContext as MusicApplication).container.trackArtRepository
-    LaunchedEffect(track.relativePath) {
+    LaunchedEffect(track.id, track.relativePath, track.addedAt) {
         repo.ensureLoadedForTrack(track)
     }
     TrackArtworkContent(
@@ -68,43 +69,46 @@ fun TrackArtworkFromPath(
 }
 
 @Composable
-private fun TrackArtworkContent(
+internal fun TrackArtworkContent(
     artState: kotlinx.coroutines.flow.StateFlow<TrackArtRepository.ArtLoadState>,
     modifier: Modifier = Modifier,
     cornerSize: Dp = 20.dp,
     fallbackLabel: String? = null,
     onReload: () -> Unit,
 ) {
-    val state by artState.collectAsStateWithLifecycle()
-    LaunchedEffect(state) {
-        if (state is TrackArtRepository.ArtLoadState.Evicted) onReload()
-    }
+    // A collector's remembered value must never outlive the track it belongs to.
+    key(artState) {
+        val state by artState.collectAsStateWithLifecycle()
+        LaunchedEffect(state) {
+            if (state is TrackArtRepository.ArtLoadState.Evicted) onReload()
+        }
 
-    Box(
-        modifier = modifier
-            .clip(RoundedCornerShape(cornerSize))
-            .background(MaterialTheme.colorScheme.surfaceVariant),
-        contentAlignment = Alignment.Center,
-    ) {
-        when (val current = state) {
-            is TrackArtRepository.ArtLoadState.Ready -> {
-                Image(
-                    bitmap = current.bitmap.asImageBitmap(),
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
+        Box(
+            modifier = modifier
+                .clip(RoundedCornerShape(cornerSize))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center,
+        ) {
+            when (val current = state) {
+                is TrackArtRepository.ArtLoadState.Ready -> {
+                    Image(
+                        bitmap = current.bitmap.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
 
-            is TrackArtRepository.ArtLoadState.Missing,
-            is TrackArtRepository.ArtLoadState.Loading,
-            is TrackArtRepository.ArtLoadState.Evicted,
-            -> {
-                Text(
-                    text = fallbackLabel ?: "♪",
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                )
+                is TrackArtRepository.ArtLoadState.Missing,
+                is TrackArtRepository.ArtLoadState.Loading,
+                is TrackArtRepository.ArtLoadState.Evicted,
+                -> {
+                    Text(
+                        text = fallbackLabel ?: "♪",
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
         }
     }

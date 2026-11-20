@@ -17,8 +17,8 @@ export async function authorizedFetch(url: string, init: RequestInit = {}) {
   const token = loadAccessToken(url)
   if (token) headers.set('Authorization', `Bearer ${token}`)
   const response = await fetch(url, { ...init, headers })
-  if (response.status === 401) throw new Error('Р’РІРµРґРёС‚Рµ РєР»СЋС‡ РґРѕСЃС‚СѓРїР° СЃРµСЂРІРµСЂР° РІ РЅР°СЃС‚СЂРѕР№РєР°С…')
-  if (response.status === 503) throw new Error('Р”РѕСЃС‚СѓРї РЅР° Р·Р°РїРёСЃСЊ РЅРµ РЅР°СЃС‚СЂРѕРµРЅ РЅР° СЃРµСЂРІРµСЂРµ')
+  if (response.status === 401) throw new Error('Введите ключ доступа сервера в настройках')
+  if (response.status === 503) throw new Error('Доступ на запись не настроен на сервере')
   return response
 }
 export async function uploadAudio(baseUrl: string, folder: string, blob: Blob, name: string) {
@@ -27,6 +27,6 @@ export async function uploadAudio(baseUrl: string, folder: string, blob: Blob, n
   const headers = new Headers({ 'X-File-Size': String(blob.size) })
   headers.set('X-Content-SHA256', await sha256Blob(blob))
   const response = await authorizedFetch(`${baseUrl.replace(/\/$/, '')}/api/upload?path=${encodeURIComponent(folder)}`, { method: 'POST', headers, body })
-  if (!response.ok) throw new Error(`РћС€РёР±РєР° Р·Р°РіСЂСѓР·РєРё ${name}: ${response.status}`)
+  if (!response.ok) throw new Error(`Ошибка загрузки ${name}: ${response.status}`)
   return response
 }

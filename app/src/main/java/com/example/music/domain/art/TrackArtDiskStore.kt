@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import java.io.File
 import java.security.MessageDigest
+import android.util.AtomicFile
+import java.io.IOException
 
 /** Persistent on-device cache of cover art downloaded from the music server. */
 class TrackArtDiskStore(context: Context) {
@@ -13,16 +15,17 @@ class TrackArtDiskStore(context: Context) {
         dir.mkdirs()
     }
 
-    fun loadBitmap(cacheKey: String): Bitmap? {
+    fun loadBitmap(cacheKey: String): Bitmap? = synchronized(lock) {
         val file = fileForKey(cacheKey)
-        if (!file.isFile || file.length() <= 128L) return null
-        val bitmap = TrackArtCache.decodeFile(file.absolutePath)
+        val atomic = AtomicFile(file)
+        if (!file.exists() && !File(file.path + ".bak").exists()) return@synchronized null
+        val bitmap = runCatching { atomic.openRead().use { TrackArtCache.decode(it.readBytes()) } }.getOrNull()
         if (bitmap == null || bitmap.width <= 1 || bitmap.height <= 1) {
             bitmap?.recycle()
-            file.delete()
-            return null
+            atomic.delete()
+            return@synchronized null
         }
-        return bitmap
+        bitmap
     }
 
     fun save(cacheKey: String, bytes: ByteArray): File? {
@@ -34,17 +37,23 @@ class TrackArtDiskStore(context: Context) {
         }
     }
 
-    fun saveBitmap(cacheKey: String, bitmap: Bitmap): File? {
-        if (bitmap.width <= 1 || bitmap.height <= 1) return null
+    fun saveBitmap(cacheKey: String, bitmap: Bitmap): File? = synchronized(lock) {
+        if (bitmap.width <= 1 || bitmap.height <= 1) return@synchronized null
         val file = fileForKey(cacheKey)
-        file.outputStream().use { stream ->
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)
+        val atomic = AtomicFile(file)
+        val stream = atomic.startWrite()
+        try {
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)) throw IOException("Cannot encode cover")
+            atomic.finishWrite(stream)
+        } catch (error: Exception) {
+            atomic.failWrite(stream)
+            throw error
         }
-        return file.takeIf { it.length() > 128L }
+        file.takeIf { it.length() > 128L }
     }
 
-    fun delete(cacheKey: String) {
-        fileForKey(cacheKey).delete()
+    fun delete(cacheKey: String) = synchronized(lock) {
+        AtomicFile(fileForKey(cacheKey)).delete()
     }
 
     private fun fileForKey(cacheKey: String): File {
@@ -53,4 +62,6 @@ class TrackArtDiskStore(context: Context) {
             .joinToString("") { byte -> "%02x".format(byte) }
         return File(dir, "$digest.jpg")
     }
+
+    companion object { private val lock = Any() }
 }

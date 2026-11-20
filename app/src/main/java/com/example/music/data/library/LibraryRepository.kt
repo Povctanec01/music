@@ -152,7 +152,7 @@ class LibraryRepository(
             _tracks.value = result
             indexedFolder = folderString
             preferences.saveCachedTracks(folderString, result)
-            trackArtRepository.reloadTracks(result)
+            trackArtRepository.reloadTracks(result, folder)
         } catch (e: CancellationException) {
             throw e
         } catch (e: SecurityException) {

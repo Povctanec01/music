@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.CancellationException
 import java.util.concurrent.ConcurrentHashMap
 
 class TrackArtRepository(
@@ -37,6 +38,7 @@ class TrackArtRepository(
     private val publicFlows = ConcurrentHashMap<String, StateFlow<ArtLoadState>>()
     private val requests = ConcurrentHashMap<String, ArtRequest>()
     private val inFlight = ConcurrentHashMap<String, Job>()
+    private val migratedFolders = ConcurrentHashMap.newKeySet<String>()
 
     sealed interface ArtLoadState {
         data object Loading : ArtLoadState
@@ -114,7 +116,15 @@ class TrackArtRepository(
         }
     }
 
-    fun reloadTracks(tracks: List<Track>) {
+    fun reloadTracks(tracks: List<Track>, folderUri: Uri? = null) {
+        if (tracks.isNotEmpty()) scope.launch {
+            val tree = folderUri ?: sidecarArtSync.musicFolderUri() ?: return@launch
+            val folder = tree.toString()
+            if (migratedFolders.add(folder)) {
+                try { sidecarArtSync.hideLegacyGalleryCovers(tracks, tree) }
+                catch (error: Exception) { migratedFolders.remove(folder); ArtLog.w("art.migrate", folder, error) }
+            }
+        }
         // Lazy lists request their visible artwork separately. Do not decode
         // the entire library into StateFlows after every scan.
         tracks.filter {
@@ -196,14 +206,13 @@ class TrackArtRepository(
             extraPaths = Array(extraPaths.size) { extraPaths[it] },
             contentUri = contentUri,
         )
-        return publicFlows.getOrPut(cacheKey) {
+        val mutable = mutableFlows.computeIfAbsent(cacheKey) {
             val cached = localCachedBitmap(cacheKey)
-            val mutable = MutableStateFlow(
+            MutableStateFlow<ArtLoadState>(
                 if (cached != null) ArtLoadState.Ready(cached) else ArtLoadState.Loading,
             )
-            mutableFlows[cacheKey] = mutable
-            mutable.asStateFlow()
         }
+        return publicFlows.computeIfAbsent(cacheKey) { mutable.asStateFlow() }
     }
 
     fun requestLoad(
@@ -228,7 +237,7 @@ class TrackArtRepository(
         vararg extraPaths: String,
     ): StateFlow<ArtLoadState> = observeFor(relativePath, version, contentUri, *extraPaths)
 
-    private fun scheduleLoad(request: ArtRequest, force: Boolean = false) {
+    @Synchronized private fun scheduleLoad(request: ArtRequest, force: Boolean = false) {
         val flow = mutableFlows[request.cacheKey] ?: return
         if (flow.value is ArtLoadState.Ready) return
 
@@ -241,7 +250,7 @@ class TrackArtRepository(
             try {
                 loadArt(request, flow)
             } finally {
-                inFlight.remove(request.cacheKey)
+                inFlight.remove(request.cacheKey, kotlinx.coroutines.currentCoroutineContext()[Job])
             }
         }
     }
@@ -298,6 +307,8 @@ class TrackArtRepository(
                     flow.value = ArtLoadState.Missing
                     ArtLog.w("art.load.missing", "${request.relativePath} ${System.currentTimeMillis() - start}ms")
                     true
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     flow.value = ArtLoadState.Missing
                     ArtLog.e("art.load.error", request.relativePath, e)

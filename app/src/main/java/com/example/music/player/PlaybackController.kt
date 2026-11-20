@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Bundle
 import androidx.core.content.ContextCompat
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -60,7 +61,6 @@ class PlaybackController(
     private var controller: MediaController? = null
     private var positionJob: Job? = null
     private var sleepJob: Job? = null
-    private var persistJob: Job? = null
     private var restored = false
     private var lastTrackedMediaId: String? = null
     private var lastTrackedPositionMs: Long = 0L
@@ -79,7 +79,6 @@ class PlaybackController(
         override fun onEvents(player: Player, events: Player.Events) {
             trackListeningSignals(player)
             publish(player)
-            persist(player)
             if (shuffleEnabled && events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION)) {
                 val currentId = player.currentMediaItem?.mediaId
                 if (currentId != null) rememberRecent(currentId)
@@ -125,20 +124,11 @@ class PlaybackController(
                 player.setMediaItems(queue.map { it.toMediaItem() }, startIndex, C.TIME_UNSET)
                 player.prepare()
                 player.play()
-                preferences.savePlayback(
-                    queueIds = queue.map { it.id },
-                    index = startIndex,
-                    positionMs = 0L,
-                    mediaId = tracks[safeIndex].id,
-                )
             }
         } else {
             player.setMediaItems(tracks.map { it.toMediaItem() }, safeIndex, C.TIME_UNSET)
             player.prepare()
             player.play()
-            scope.launch {
-                preferences.savePlayback(tracks.map { it.id }, safeIndex, 0L, tracks[safeIndex].id)
-            }
         }
     }
 
@@ -404,12 +394,6 @@ class PlaybackController(
         player.setMediaItems(queue.map { it.toMediaItem() }, startIndex, C.TIME_UNSET)
         player.prepare()
         player.play()
-        preferences.savePlayback(
-            queueIds = queue.map { it.id },
-            index = startIndex,
-            positionMs = 0L,
-            mediaId = track.id,
-        )
     }
 
     private suspend fun buildShuffleQueue(startTrack: Track, upcomingCount: Int = 4): List<Track> {
@@ -611,20 +595,6 @@ class PlaybackController(
         )
     }
 
-    private fun persist(player: Player) {
-        persistJob?.cancel()
-        persistJob = scope.launch {
-            delay(400)
-            val ids = List(player.mediaItemCount) { player.getMediaItemAt(it).mediaId }
-            preferences.savePlayback(
-                queueIds = ids,
-                index = player.currentMediaItemIndex.coerceAtLeast(0),
-                positionMs = player.currentPosition.coerceAtLeast(0L),
-                mediaId = player.currentMediaItem?.mediaId,
-            )
-        }
-    }
-
     private suspend fun fadeOutAndPause(player: Player) {
         val original = player.volume
         try {
@@ -651,10 +621,17 @@ fun Track.toMediaItem(): MediaItem =
                 .setTitle(title)
                 .setArtist(artistOrUnknown)
                 .setAlbumTitle(albumOrUnknown)
+                .setExtras(Bundle().apply {
+                    putString(PLAYBACK_ART_PATH, relativePath)
+                    putLong(PLAYBACK_ART_VERSION, addedAt)
+                })
                 .setIsPlayable(true)
                 .build(),
         )
         .build()
+
+internal const val PLAYBACK_ART_PATH = "music.art.path"
+internal const val PLAYBACK_ART_VERSION = "music.art.version"
 
 fun loadEmbeddedArt(context: Context, uri: Uri): Bitmap? =
     TrackMetadataReader.readEmbeddedArt(context, uri)

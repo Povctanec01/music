@@ -9,18 +9,22 @@ import com.example.music.data.remote.ServerClient
 import com.example.music.domain.art.ArtLog
 import com.example.music.domain.model.Track
 
-/** Downloads cover art from the server and stores `{stem}.jpg` next to audio in SAF folder. */
+/** Covers live in private application storage, outside MediaStore/the gallery. */
 class SidecarArtSync(
     private val context: Context,
     private val preferences: AppPreferences,
     private val storage: SafStorage,
     private val server: ServerClient,
 ) {
+    private val disk = TrackArtDiskStore(context.applicationContext)
+
     suspend fun musicFolderUri(): Uri? = preferences.folderUriOnce()?.let(Uri::parse)
 
     suspend fun loadSidecarBitmap(audioRelativePath: String, audioUri: Uri? = null): Bitmap? {
+        disk.loadBitmap(TrackArtCache.key(audioRelativePath))?.let { return it }
         audioUri?.let { uri ->
             storage.readSidecarNextToAudio(uri)?.let {
+                disk.saveBitmap(TrackArtCache.key(audioRelativePath), it)
                 ArtLog.d("sidecar.read.nextToAudio", "hit path=$audioRelativePath")
                 return it
             }
@@ -30,6 +34,7 @@ class SidecarArtSync(
             return null
         }
         return storage.readSidecarBitmap(treeUri, audioRelativePath)?.also {
+            disk.saveBitmap(TrackArtCache.key(audioRelativePath), it)
             ArtLog.d("sidecar.read.tree", "hit path=$audioRelativePath")
         } ?: run {
             ArtLog.d("sidecar.read.miss", audioRelativePath)
@@ -114,12 +119,17 @@ class SidecarArtSync(
     }
 
     suspend fun saveBytes(audioUri: Uri?, audioRelativePath: String, bytes: ByteArray): Boolean {
-        if (bytes.size <= 128) return false
-        if (audioUri != null && storage.writeSidecarNextToAudio(audioUri, bytes)) {
-            return true
+        return disk.save(TrackArtCache.key(audioRelativePath), bytes) != null
+    }
+
+    suspend fun hideLegacyGalleryCovers(tracks: List<Track>, folder: Uri? = null) {
+        val tree = folder ?: musicFolderUri() ?: return
+        storage.hideLegacySidecars(tree, tracks.map { it.relativePath }) { path, bytes ->
+            val key = TrackArtCache.key(path)
+            val existing = disk.loadBitmap(key)
+            if (existing != null) { existing.recycle(); true }
+            else disk.save(key, bytes) != null
         }
-        val treeUri = preferences.folderUriOnce()?.let(Uri::parse) ?: return false
-        return storage.writeSidecarImage(treeUri, audioRelativePath, bytes)
     }
 
     private fun persistSidecar(
@@ -132,8 +142,7 @@ class SidecarArtSync(
             ArtLog.w("sidecar.persist.skipSmall", "path=$audioRelativePath bytes=${bytes.size}")
             return
         }
-        val nextOk = audioUri != null && storage.writeSidecarNextToAudio(audioUri, bytes)
-        val treeOk = storage.writeSidecarImage(treeUri, audioRelativePath, bytes)
-        ArtLog.d("sidecar.persist", "path=$audioRelativePath nextToAudio=$nextOk tree=$treeOk bytes=${bytes.size}")
+        val saved = disk.save(TrackArtCache.key(audioRelativePath), bytes) != null
+        ArtLog.d("sidecar.persist.private", "path=$audioRelativePath saved=$saved bytes=${bytes.size}")
     }
 }

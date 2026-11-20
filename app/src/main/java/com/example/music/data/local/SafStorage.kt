@@ -14,6 +14,31 @@ import com.example.music.data.download.DownloadFiles
 
 class SafStorage(private val context: Context) {
 
+    /** Rename only track-matched covers, after a verified private copy was saved.
+     * Hidden copies preserve user files and do not hide audio with a folder-wide .nomedia. */
+    fun hideLegacySidecars(treeUri: Uri, audioPaths: List<String>, save: (String, ByteArray) -> Boolean) {
+        for ((folder, paths) in audioPaths.groupBy { it.substringBeforeLast('/', "") }) {
+            val parent = runCatching { directory(treeUri, if (folder.isEmpty()) emptyList() else splitRelativePath(folder), false) }
+                .getOrNull() ?: continue
+            val files = parent.listFiles()
+            val audioNames = files.filter { it.isFile }.mapNotNull { it.name?.lowercase() }.toSet()
+            val covers = paths.filter { it.substringAfterLast('/').lowercase() in audioNames }.flatMap { path ->
+                TrackSidecarArt.sidecarFileNames(TrackSidecarArt.stemFromAudioPath(path)).map { it.lowercase() to path }
+            }.groupBy({ it.first }, { it.second })
+            for (file in files) {
+                val name = file.name ?: continue
+                val matching = covers[name.lowercase()] ?: continue
+                if (!file.isFile) continue
+                runCatching {
+                    val bytes = context.contentResolver.openInputStream(file.uri)?.use { it.readBytes() } ?: return@runCatching
+                    if (matching.all { save(it, bytes) } && parent.findFile(".music-cover-$name") == null) {
+                        file.renameTo(".music-cover-$name")
+                    }
+                }
+            }
+        }
+    }
+
     /** Providers without rename support fail safely instead of overwriting the old audio. */
     fun replaceVerified(treeUri: Uri, relativePath: String, source: File, checksum: String?, canContinue: () -> Boolean = { true }): Uri {
         DownloadFiles.verify(source, source.length(), checksum)
@@ -125,7 +150,7 @@ class SafStorage(private val context: Context) {
         if (!audio.isFile) return false
         val parent = audio.parentFile ?: return false
         val stem = audio.name?.substringBeforeLast('.')?.takeIf { it.isNotBlank() } ?: return false
-        val sidecarName = "$stem.jpg"
+        val sidecarName = ".music-cover-$stem.jpg"
         val sidecar = parent.findFileIgnoreCase(sidecarName)?.takeIf { it.isFile }
             ?: parent.createFile("image/jpeg", sidecarName)
             ?: parent.createFile("image/jpg", sidecarName)
@@ -145,7 +170,8 @@ class SafStorage(private val context: Context) {
         if (!audio.isFile) return null
         val parent = audio.parentFile ?: return null
         val stem = audio.name?.substringBeforeLast('.') ?: return null
-        val sidecar = parent.findFileIgnoreCase("$stem.jpg") ?: return null
+        val sidecar = parent.findFileIgnoreCase(".music-cover-$stem.jpg")
+            ?: parent.findFileIgnoreCase("$stem.jpg") ?: return null
         if (!sidecar.isFile) return null
         val bytes = context.contentResolver.openInputStream(sidecar.uri)?.use { it.readBytes() } ?: return null
         return TrackArtCache.decode(bytes)
@@ -154,13 +180,14 @@ class SafStorage(private val context: Context) {
 
     fun writeSidecarImage(treeUri: Uri, audioRelativePath: String, bytes: ByteArray): Boolean {
         if (bytes.size <= 128) return false
-        val sidecarPath = TrackSidecarArt.primarySidecarRelativePath(audioRelativePath)
+        val sidecarPath = hiddenSidecarPath(audioRelativePath)
         return writeBytes(treeUri, sidecarPath, "image/jpeg", bytes)
     }
 
     fun readSidecarBitmap(treeUri: Uri, audioRelativePath: String): Bitmap? {
         val sidecarPath = TrackSidecarArt.primarySidecarRelativePath(audioRelativePath)
-        val bytes = readBytes(treeUri, sidecarPath) ?: return null
+        val bytes = readBytes(treeUri, hiddenSidecarPath(audioRelativePath))
+            ?: readBytes(treeUri, sidecarPath) ?: return null
         return TrackArtCache.decode(bytes)
             ?.takeIf { it.width > 1 && it.height > 1 }
     }
@@ -240,6 +267,12 @@ class SafStorage(private val context: Context) {
             throw IOException("Некорректный путь: $relativePath")
         }
         return parts
+    }
+
+    private fun hiddenSidecarPath(path: String): String {
+        val normal = TrackSidecarArt.primarySidecarRelativePath(path)
+        val folder = normal.substringBeforeLast('/', "")
+        return (if (folder.isEmpty()) "" else "$folder/") + ".music-cover-${normal.substringAfterLast('/')}"
     }
 
     private fun DocumentFile.findFileIgnoreCase(name: String): DocumentFile? {
