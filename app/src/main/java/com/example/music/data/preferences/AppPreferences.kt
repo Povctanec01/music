@@ -29,8 +29,12 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import com.example.music.data.remote.ServerAddresses
 
-private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "music_prefs")
+private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "music_prefs",
+    produceMigrations = { listOf(ServerAddressMigration()) },
+)
 
 class AppPreferences(
     context: Context,
@@ -299,8 +303,8 @@ class AppPreferences(
     }
 
     companion object {
-        const val DEFAULT_LAN_URL = "http://192.168.1.80:8080"
-        const val DEFAULT_TAILSCALE_URL = "http://100.106.26.26:8080"
+        const val DEFAULT_LAN_URL = ServerAddresses.LAN
+        const val DEFAULT_TAILSCALE_URL = ServerAddresses.TAILSCALE
         const val DEFAULT_GITHUB_REPO = "Povctanec01/music"
         /** One-time forced sidecar refresh for existing local library tracks. */
         const val CURRENT_SIDECAR_ART_REFRESH_VERSION = 2

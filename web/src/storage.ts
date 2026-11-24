@@ -65,7 +65,7 @@ export function saveBehavior(behavior: Record<string, ListeningBehavior>) {
 export function loadServerUrl() {
   const saved = readStorage(SERVER_URL_KEY)
   if (typeof window === 'undefined') {
-    return saved ?? 'http://192.168.1.80:8080'
+    return saved ?? 'http://192.168.1.76:8080'
   }
 
   const origin = window.location.origin
@@ -78,7 +78,7 @@ export function loadServerUrl() {
     return origin
   }
 
-  return saved ?? 'http://192.168.1.80:8080'
+  return saved === 'http://192.168.1.80:8080' ? 'http://192.168.1.76:8080' : (saved ?? 'http://192.168.1.76:8080')
 }
 
 export function saveServerUrl(url: string) {
