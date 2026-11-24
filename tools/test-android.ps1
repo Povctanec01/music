@@ -42,7 +42,7 @@ if (-not $SkipInstall) {
 Invoke-TestAdb shell pm grant com.example.music android.permission.POST_NOTIFICATIONS
 Invoke-TestAdb shell cmd package compile -m speed -f com.example.music
 Invoke-TestAdb shell cmd package compile -m speed -f com.example.music.test
-Invoke-InstrumentedCheck -Class 'com.example.music.ReliabilityTest,com.example.music.PlaybackAndDownloadTest,com.example.music.PlaybackRegressionTest,com.example.music.ArtworkUiRegressionTest' -LogName 'core.log'
+Invoke-InstrumentedCheck -Class 'com.example.music.ReliabilityTest,com.example.music.PlaybackAndDownloadTest,com.example.music.PlaybackRegressionTest,com.example.music.ArtworkUiRegressionTest,com.example.music.QueueRegressionTest' -LogName 'core.log'
 if ($Reboot) {
     Invoke-InstrumentedCheck -Class 'com.example.music.RebootPersistenceTest#aPrepare' -LogName 'before-reboot.log'
     Invoke-TestAdb reboot

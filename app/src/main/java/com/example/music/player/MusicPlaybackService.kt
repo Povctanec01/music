@@ -115,7 +115,7 @@ class MusicPlaybackService : MediaSessionService() {
     private fun observeCurrentArtwork() {
         val current = player?.currentMediaItem
         val path = current?.mediaMetadata?.extras?.getString(PLAYBACK_ART_PATH)
-        val identity = current?.let { "${it.mediaId}|${it.localConfiguration?.uri}|$path" }
+        val identity = current?.let { "${it.mediaId}|${it.localConfiguration?.uri}|$path|${it.mediaMetadata.extras?.getString(QUEUE_ENTRY)}|${player?.currentMediaItemIndex}" }
         if (identity == artworkIdentity) return
         artworkIdentity = identity
         artworkJob?.cancel()

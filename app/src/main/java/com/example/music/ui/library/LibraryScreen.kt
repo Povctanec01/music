@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material3.AlertDialog
@@ -241,6 +242,7 @@ fun LibraryScreen(
                                 onOpenPlayer()
                             },
                             onFavorite = { viewModel.toggleFavorite(it) },
+                            onPlayNext = { viewModel.playNext(it) },
                         )
                     } else if (state.rows.isEmpty()) {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -323,6 +325,7 @@ private fun LibraryHomeContent(
     playerCurrentId: String?,
     onPlay: (Track) -> Unit,
     onFavorite: (String) -> Unit,
+    onPlayNext: (Track) -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -362,6 +365,7 @@ private fun LibraryHomeContent(
                 favorites = state.favorites,
                 onPlay = onPlay,
                 onFavorite = onFavorite,
+                onPlayNext = onPlayNext,
             )
         }
     }
@@ -374,6 +378,7 @@ private fun RecommendationRow(
     favorites: Set<String>,
     onPlay: (Track) -> Unit,
     onFavorite: (String) -> Unit,
+    onPlayNext: (Track) -> Unit,
 ) {
     Column {
         Column(Modifier.padding(horizontal = 16.dp)) {
@@ -392,7 +397,7 @@ private fun RecommendationRow(
             items(section.tracks, key = { it.id }) { track ->
                 ElevatedCard(
                     modifier = Modifier
-                        .size(width = 176.dp, height = 252.dp)
+                        .size(width = 176.dp, height = 292.dp)
                         .clickable { onPlay(track) },
                 ) {
                     Column(Modifier.padding(12.dp)) {
@@ -441,6 +446,9 @@ private fun RecommendationRow(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(formatDuration(track.durationMs), style = MaterialTheme.typography.labelSmall)
+                            IconButton(onClick = { onPlayNext(track) }, modifier = Modifier.size(28.dp)) {
+                                Icon(Icons.AutoMirrored.Filled.PlaylistPlay, contentDescription = "Воспроизвести следующим")
+                            }
                             IconButton(onClick = { onFavorite(track.id) }, modifier = Modifier.size(28.dp)) {
                                 Icon(
                                     if (track.id in favorites) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
@@ -535,6 +543,9 @@ private fun TrackRow(
             trailingContent = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(formatDuration(track.durationMs), style = MaterialTheme.typography.bodySmall)
+                    IconButton(onClick = onPlayNext, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.AutoMirrored.Filled.PlaylistPlay, contentDescription = "Воспроизвести следующим")
+                    }
                     IconButton(onClick = onFavorite) {
                         Icon(
                             if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
@@ -548,7 +559,7 @@ private fun TrackRow(
                         }
                         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                             DropdownMenuItem(
-                                text = { Text("Играть следующим") },
+                                text = { Text("Воспроизвести следующим") },
                                 onClick = {
                                     onPlayNext()
                                     menu = false

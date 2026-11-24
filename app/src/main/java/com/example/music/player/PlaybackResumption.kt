@@ -11,8 +11,7 @@ internal suspend fun AppPreferences.resumptionPlaylist(): MediaSession.MediaItem
     val byId = cachedTracks(folder).associateBy { it.id }
     val tracks = snapshot.queueIds.mapNotNull { byId[it] }
     if (tracks.isEmpty()) throw IllegalStateException("Сохранённая очередь пуста")
-    val currentId = snapshot.mediaId ?: snapshot.queueIds.getOrNull(snapshot.index)
-    val index = tracks.indexOfFirst { it.id == currentId }
+    val index = restoredQueueIndex(snapshot.queueIds, snapshot.index, snapshot.mediaId, byId.keys)
     return MediaSession.MediaItemsWithStartPosition(
         tracks.map { it.toMediaItem() }, index.coerceAtLeast(0),
         if (index >= 0) snapshot.positionMs.coerceAtLeast(0L) else 0L,

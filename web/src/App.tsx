@@ -28,6 +28,7 @@ import { TrackArt } from './TrackArt'
 import { authorizedFetch, loadAccessToken, saveAccessToken, uploadAudio } from './api'
 import { TrashPanel } from './TrashPanel'
 import { registerMediaActions, updateMediaMetadata, updateMediaPlayback, updateMediaPosition } from './mediaSession'
+import { emptyQueue, selectedQueue, enqueueNext, hasPriorityNext, advanceQueue, selectQueuedTrack, removeQueuedTrack, type PlaybackQueue } from './playbackQueue'
 import type { ListeningBehavior, MusicTrack, RecommendationSection, ReleaseInfo } from './types'
 
 function App() {
@@ -37,8 +38,7 @@ function App() {
   const [remoteTracks, setRemoteTracks] = useState<MusicTrack[]>([])
   const [favorites, setFavorites] = useState<Set<string>>(new Set(loadFavorites()))
   const [behavior, setBehavior] = useState<Record<string, ListeningBehavior>>(loadBehavior())
-  const [queue, setQueue] = useState<MusicTrack[]>([])
-  const [currentId, setCurrentId] = useState<string | null>(null)
+  const [playbackQueue, setPlaybackQueue] = useState<PlaybackQueue>(emptyQueue)
   const [playbackRevision, setPlaybackRevision] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
   const [positionMs, setPositionMs] = useState(0)
@@ -77,10 +77,12 @@ function App() {
     () => sortTracks(filterTracks(remoteTracks, searchQuery), sortMode),
     [remoteTracks, searchQuery, sortMode],
   )
-  const currentIndex = queue.findIndex((track) => track.id === currentId)
+  const queue = playbackQueue.entries
+  const currentIndex = playbackQueue.index
   const currentTrack = currentIndex >= 0 ? queue[currentIndex] : null
+  const currentId = currentTrack?.id ?? null
   const hasTrack = currentTrack !== null
-  const canGoNext = hasTrack && (shuffle ? (remoteTracks.length || queue.length) > 1 : currentIndex < queue.length - 1)
+  const canGoNext = hasTrack && (hasPriorityNext(playbackQueue) || (shuffle ? (remoteTracks.length || queue.length) > 1 : currentIndex < queue.length - 1))
   const canGoPrevious = hasTrack && (shuffle ? recentShuffleIdsRef.current.length >= 2 : currentIndex > 0)
 
   const mediaPlay = useEffectEvent(() => resumePlayback())
@@ -303,12 +305,6 @@ function App() {
     }
   }, [currentTrack, durationMs, shuffle, queue, currentIndex, remoteTracks, behavior, favorites])
 
-  useEffect(() => {
-    if (shuffle && remoteTracks.length > 1) {
-      setQueue((current) => (remoteTracks.length > current.length ? remoteTracks : current))
-    }
-  }, [shuffle, remoteTracks])
-
   async function refreshRemoteLibrary() {
     setLoadingRemote(true)
     try {
@@ -360,16 +356,7 @@ function App() {
       if (!response.ok) throw new Error(`Удаление: ${response.status}`)
       const deleted = await response.json() as { trashId?: string }
       setLastDeletedId(deleted.trashId ?? null)
-      setQueue((current) => current.filter((item) => item.id !== track.id))
-      if (currentId === track.id) {
-        setCurrentId(null)
-        setIsPlaying(false)
-        const audio = audioRef.current
-        if (audio) {
-          audio.pause()
-          audio.removeAttribute('src')
-        }
-      }
+      setPlaybackQueue((current) => removeQueuedTrack(current, track.id))
       setStatus(`Удалено: ${track.title}`)
       await refreshRemoteLibrary()
     } catch (error) {
@@ -410,10 +397,14 @@ function App() {
 
   function playSelection(track: MusicTrack, tracks: MusicTrack[]) {
     const pool = shuffle && remoteTracks.length > tracks.length ? remoteTracks : tracks
-    setQueue(pool)
+    setPlaybackQueue(selectedQueue(pool, track))
     rememberShuffleId(track.id)
-    setCurrentId(track.id)
     if (currentId === track.id) setPlaybackRevision((value) => value + 1)
+  }
+
+  function playTrackNext(track: MusicTrack) {
+    setPlaybackQueue((current) => enqueueNext(current, track))
+    setStatus(`Следующим: ${track.title}`)
   }
 
   function rememberShuffleId(trackId: string) {
@@ -455,28 +446,31 @@ function App() {
   }
 
   function playNext() {
+    if (hasPriorityNext(playbackQueue)) {
+      rememberShuffleId(queue[currentIndex + 1].id)
+      setPlaybackQueue(advanceQueue(playbackQueue))
+      return
+    }
     if (shuffle) {
       const pool = remoteTracks.length ? remoteTracks : queue
       const next = pickWeightedShuffle(pool, behavior, favorites, recentShuffleIdsRef.current.slice(-8))
       if (!next) {
-        setCurrentId(null)
+        setPlaybackQueue((current) => ({ ...current, index: -1 }))
         setIsPlaying(false)
         return
       }
       rememberShuffleId(next.id)
-      if (!queue.some((track) => track.id === next.id)) {
-        setQueue(pool)
-      }
-      setCurrentId(next.id)
+      setPlaybackQueue(selectQueuedTrack(playbackQueue, next))
       if (currentId === next.id) setPlaybackRevision((value) => value + 1)
       return
     }
     if (currentIndex < 0 || currentIndex >= queue.length - 1) {
-      setCurrentId(null)
+      setPlaybackQueue((current) => ({ ...current, index: -1 }))
       setIsPlaying(false)
       return
     }
-    setCurrentId(queue[currentIndex + 1].id)
+    rememberShuffleId(queue[currentIndex + 1].id)
+    setPlaybackQueue(advanceQueue(playbackQueue))
   }
 
   function playPrevious() {
@@ -487,12 +481,13 @@ function App() {
       if (!previous) return
       maybeRecordSkip()
       recent.pop()
-      setCurrentId(previous.id)
+      setPlaybackQueue(selectQueuedTrack(playbackQueue, previous))
+      if (currentId === previous.id) setPlaybackRevision((value) => value + 1)
       return
     }
     if (currentIndex <= 0) return
     maybeRecordSkip()
-    setCurrentId(queue[currentIndex - 1].id)
+    setPlaybackQueue((current) => ({ ...current, index: current.index - 1 }))
   }
 
   function maybeRecordSkip() {
@@ -618,6 +613,7 @@ function App() {
                 onExpandedGroupChange={setExpandedGroup}
                 onToggleFavorite={toggleFavorite}
                 onPlay={(track, tracks) => playSelection(track, tracks)}
+                onPlayNext={playTrackNext}
               />
             }
           />
@@ -633,6 +629,7 @@ function App() {
                 onUploadDirChange={setUploadDir}
                 onUpload={uploadFiles}
                 onPlay={(track, tracks) => playSelection(track, tracks ?? remoteTracks)}
+                onPlayNext={playTrackNext}
                 onToggleFavorite={toggleFavorite}
                 onDelete={(track) => void deleteRemoteTrack(track)}
                 currentId={currentId}
@@ -792,6 +789,7 @@ function HomePage(props: {
   onExpandedGroupChange: (key: string | null) => void
   onToggleFavorite: (trackId: string) => void
   onPlay: (track: MusicTrack, tracks: MusicTrack[]) => void
+  onPlayNext: (track: MusicTrack) => void
 }) {
   const {
     libraryTracks,
@@ -808,6 +806,7 @@ function HomePage(props: {
     onExpandedGroupChange,
     onToggleFavorite,
     onPlay,
+    onPlayNext,
   } = props
 
   const favoriteList = useMemo(
@@ -909,6 +908,7 @@ function HomePage(props: {
                       favorite={favorites.has(track.id)}
                       onPlay={() => onPlay(track, section.tracks)}
                       onToggleFavorite={() => onToggleFavorite(track.id)}
+                      onPlayNext={() => onPlayNext(track)}
                     />
                   ))}
                 </div>
@@ -927,6 +927,7 @@ function HomePage(props: {
                 favorite={favorites.has(track.id)}
                 onPlay={() => onPlay(track, libraryTracks)}
                 onToggleFavorite={() => onToggleFavorite(track.id)}
+                onPlayNext={() => onPlayNext(track)}
               />
             ))}
           </div>
@@ -943,6 +944,7 @@ function HomePage(props: {
                 favorite
                 onPlay={() => onPlay(track, favoriteList)}
                 onToggleFavorite={() => onToggleFavorite(track.id)}
+                onPlayNext={() => onPlayNext(track)}
               />
             ))}
           </div>
@@ -983,6 +985,7 @@ function HomePage(props: {
                         favorite={favorites.has(track.id)}
                         onPlay={() => onPlay(track, group.tracks)}
                         onToggleFavorite={() => onToggleFavorite(track.id)}
+                        onPlayNext={() => onPlayNext(track)}
                       />
                     ))}
                   </div>
@@ -1003,6 +1006,7 @@ function SyncPage(props: {
   onUploadDirChange: (value: string) => void
   onUpload: (files: FileList | null) => Promise<void>
   onPlay: (track: MusicTrack, tracks?: MusicTrack[]) => void
+  onPlayNext: (track: MusicTrack) => void
   onToggleFavorite: (trackId: string) => void
   onDelete: (track: MusicTrack) => void
   currentId: string | null
@@ -1115,6 +1119,7 @@ function SyncPage(props: {
                   favorite={favorites.has(track.id)}
                   onPlay={() => onPlay(track, remoteTracks)}
                   onToggleFavorite={() => onToggleFavorite(track.id)}
+                  onPlayNext={() => props.onPlayNext(track)}
                 />
                 <TrackActionsMenu track={track} onDelete={() => onDelete(track)} />
               </div>
@@ -1390,11 +1395,13 @@ function TrackCard(props: {
   active: boolean
   favorite: boolean
   onPlay: () => void
+  onPlayNext: () => void
   onToggleFavorite: () => void
 }) {
-  const { track, active, favorite, onPlay, onToggleFavorite } = props
+  const { track, active, favorite, onPlay, onPlayNext, onToggleFavorite } = props
   return (
-    <button type="button" className={`track-card ${active ? 'active' : ''}`} onClick={onPlay}>
+    <div className={`track-card ${active ? 'active' : ''}`}>
+      <button type="button" className="track-card-main" onClick={onPlay}>
       <div className="artwork">
         <TrackArt track={track} className="artwork-image" />
       </div>
@@ -1404,17 +1411,20 @@ function TrackCard(props: {
       </div>
       <div className="card-footer">
         <span>{formatDuration(track.durationMs)}</span>
-        <span
-          className={`favorite ${favorite ? 'is-favorite' : ''}`}
-          onClick={(event) => {
-            event.stopPropagation()
-            onToggleFavorite()
-          }}
+      </div>
+      </button>
+      <div className="card-footer">
+        <PlayNextButton track={track} onClick={onPlayNext} />
+        <button
+          type="button"
+          className={`favorite plain ${favorite ? 'is-favorite' : ''}`}
+          aria-label={`Избранное: ${track.title}`}
+          onClick={onToggleFavorite}
         >
           {favorite ? '♥' : '♡'}
-        </span>
+        </button>
       </div>
-    </button>
+    </div>
   )
 }
 
@@ -1424,9 +1434,10 @@ function TrackRow(props: {
   active: boolean
   favorite: boolean
   onPlay: () => void
+  onPlayNext: () => void
   onToggleFavorite: () => void
 }) {
-  const { track, sortMode, active, favorite, onPlay, onToggleFavorite } = props
+  const { track, sortMode, active, favorite, onPlay, onPlayNext, onToggleFavorite } = props
   const trailingMeta =
     sortMode === 'date_added'
       ? formatRelativeAddedAt(track.addedAt)
@@ -1448,11 +1459,20 @@ function TrackRow(props: {
         </div>
         <span className="track-meta">{trailingMeta}</span>
       </button>
+      <PlayNextButton track={track} onClick={onPlayNext} />
       <button type="button" className={`favorite plain ${favorite ? 'is-favorite' : ''}`} onClick={onToggleFavorite}>
         {favorite ? '♥' : '♡'}
       </button>
     </div>
   )
+}
+
+function PlayNextButton({ track, onClick }: { track: MusicTrack; onClick: () => void }) {
+  return <button type="button" className="play-next-button plain" title="Воспроизвести следующим" aria-label={`Воспроизвести следующим: ${track.title}`} onClick={onClick}>
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3 5h14M3 10h14M3 15h5M14 14l7 4-7 4z" />
+    </svg>
+  </button>
 }
 
 function StatCard(props: { label: string; value: string }) {

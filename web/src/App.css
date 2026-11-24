@@ -415,6 +415,37 @@
   grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
 }
 
+.track-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.play-next-button {
+  display: grid;
+  place-items: center;
+  min-width: 36px;
+  min-height: 36px;
+  border-radius: 10px;
+  color: #9aa3bb;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.play-next-button:hover,
+.play-next-button:focus-visible {
+  color: #8ca2ff;
+  background: rgba(140, 162, 255, 0.16);
+}
+
 .track-card {
   text-align: left;
   display: flex;
